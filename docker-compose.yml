@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  trading-bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./agents/memory:/app/agents/memory
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: streamlit run monitoring/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    env_file: .env
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
