@@ -11,10 +11,13 @@ The runner:
   1. Fetches market data via DataFetcher
   2. Runs the 7-agent pipeline via TradingAgentsWrapper
   3. Runs RiskGate + PositionSizer on each decision
-  4. Logs each decision + raw data snapshot via monitoring/logger.py
-  5. Prints a clean per-ticker summary as it goes
-  6. Prints a ranked confidence table at the end
-  7. Saves the full session (decisions + gate results + sizing) to
+  4. If APPROVED: checks market hours, places order via AlpacaExecutor,
+     sends trade_placed Telegram alert
+  5. If BLOCKED: sends trade_blocked Telegram alert
+  6. Logs each decision + raw data snapshot via monitoring/logger.py
+  7. Prints a clean per-ticker summary as it goes
+  8. Prints a ranked confidence table at the end
+  9. Saves the full session (decisions + gate results + sizing + orders) to
      logs/session_YYYYMMDD_HHMMSS.json
 """
 
@@ -112,6 +115,8 @@ def _print_ticker_result(
     gate_result: dict,
     sizing: Optional[dict],
     elapsed: float,
+    order: Optional[dict] = None,
+    market_open: Optional[bool] = None,
 ) -> None:
     ticker     = decision["ticker"]
     action     = decision["action"]
@@ -132,7 +137,7 @@ def _print_ticker_result(
 
     print()
 
-    # ── Risk gate / sizing output ─────────────────────────────────────
+    # ── Risk gate / sizing / execution output ─────────────────────────
     if gate_result["approved"] and sizing:
         qty   = sizing["quantity"]
         price = sizing["entry_price"]
@@ -148,6 +153,16 @@ def _print_ticker_result(
         print(f"  Position:   ${val:,.0f} ({pct:.1f}% of portfolio)")
         print(f"  Stop loss:  ${sl:,.2f} | Take profit: ${tp:,.2f}")
         print(f"  Risk:       ${risk:,.2f}")
+        # Execution status
+        if order:
+            print(
+                f"  {_col('Order placed', 'APPROVED')}:  "
+                f"id={order.get('id')}  status={order.get('status')}"
+            )
+        elif market_open is False:
+            print(f"  {_col('Market closed', 'DIM')} — execution skipped")
+        elif market_open is None:
+            print(f"  {_col('Broker not configured', 'DIM')} — execution skipped")
 
     elif gate_result["approved"] and not sizing:
         print(
@@ -292,9 +307,13 @@ def _blocked_gate(decision: dict, reason: str) -> dict:
 # Core per-ticker runner
 # ---------------------------------------------------------------------------
 
-def run_ticker(ticker: str) -> dict:
+def run_ticker(ticker: str, execute: bool = False) -> dict:
     """
     Fetch data, run the full agent pipeline, then apply RiskGate + PositionSizer.
+
+    Args:
+        execute: when True, attempt order placement via AlpacaExecutor.
+                 When False, analysis only — no trades placed.
 
     Returns:
         {
@@ -322,6 +341,8 @@ def run_ticker(ticker: str) -> dict:
             "decision":        decision,
             "gate_result":     _blocked_gate(decision, f"Data fetch failed: {exc}"),
             "sizing":          None,
+            "order":           None,
+            "market_open":     None,
             "market_data":     {},
             "elapsed_seconds": time.monotonic() - t0,
             "error":           str(exc),
@@ -338,6 +359,8 @@ def run_ticker(ticker: str) -> dict:
             "decision":        decision,
             "gate_result":     _blocked_gate(decision, f"Agent pipeline failed: {exc}"),
             "sizing":          None,
+            "order":           None,
+            "market_open":     None,
             "market_data":     data,
             "elapsed_seconds": time.monotonic() - t0,
             "error":           str(exc),
@@ -375,11 +398,58 @@ def run_ticker(ticker: str) -> dict:
                 "[%s] Quote price unavailable — position sizing skipped", ticker
             )
 
+    # ── 5. Execution + Telegram alerts ──────────────────────────────────
+    from execution.alpaca import AlpacaExecutor
+    from monitoring.telegram_alerts import TelegramAlerter
+
+    alerter     = TelegramAlerter()
+    order       = None
+    market_open = None
+
+    if gate_result["approved"] and sizing and execute:
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        if api_key in ("", "your-key-here"):
+            logger.info("[%s] Alpaca not configured — skipping execution", ticker)
+        else:
+            try:
+                executor    = AlpacaExecutor()
+                market_open = executor.is_market_open()
+                if market_open:
+                    order = executor.place_order(
+                        ticker=ticker,
+                        action=decision["action"],
+                        quantity=sizing["quantity"],
+                    )
+                    if order:
+                        alerter.trade_placed(
+                            ticker=ticker,
+                            action=decision["action"],
+                            quantity=sizing["quantity"],
+                            price=sizing["entry_price"],
+                            order_id=order.get("id", ""),
+                        )
+                    else:
+                        logger.error("[%s] Order placement failed", ticker)
+                else:
+                    logger.info("[%s] Market closed — skipping execution", ticker)
+            except Exception as exc:
+                logger.warning("[%s] Execution error: %s", ticker, exc, exc_info=True)
+
+    elif gate_result["action"] == "BLOCKED":
+        alerter.trade_blocked(
+            ticker=ticker,
+            action=decision["action"],
+            confidence=decision["confidence"],
+            reason=gate_result["reason"],
+        )
+
     return {
         "ticker":          ticker,
         "decision":        decision,
         "gate_result":     gate_result,
         "sizing":          sizing,
+        "order":           order,
+        "market_open":     market_open,
         "market_data":     data,
         "elapsed_seconds": elapsed,
         "error":           None,
@@ -414,6 +484,11 @@ Examples:
         metavar="TICKER",
         help="One or more ticker symbols to analyse",
     )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Place orders via AlpacaExecutor when trades are approved (default: analysis only)",
+    )
 
     args = parser.parse_args()
     tickers = _load_watchlist() if args.watchlist else [t.upper() for t in args.ticker]
@@ -426,7 +501,7 @@ Examples:
 
     for i, ticker in enumerate(tickers, start=1):
         print(f"  [{i}/{len(tickers)}] Analysing {_col(ticker, 'BOLD')}...")
-        result = run_ticker(ticker)
+        result = run_ticker(ticker, execute=args.execute)
         results.append(result)
 
         _print_ticker_result(
@@ -434,6 +509,8 @@ Examples:
             result["gate_result"],
             result.get("sizing"),
             result["elapsed_seconds"],
+            order=result.get("order"),
+            market_open=result.get("market_open"),
         )
 
         if result["error"]:
