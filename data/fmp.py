@@ -23,7 +23,7 @@ class FMPClient:
         if not self.api_key:
             raise ValueError("FMP_API_KEY not set in .env")
 
-    def _get(self, endpoint: str, params: dict = None) -> dict | list:
+    def _get(self, endpoint: str, params: dict = None) -> "dict | list":
         if params is None:
             params = {}
         params["apikey"] = self.api_key
