@@ -10,10 +10,12 @@ Usage:
 The runner:
   1. Fetches market data via DataFetcher
   2. Runs the 7-agent pipeline via TradingAgentsWrapper
-  3. Logs each decision + raw data snapshot via monitoring/logger.py
-  4. Prints a clean per-ticker summary as it goes
-  5. Prints a ranked confidence table at the end
-  6. Saves the full session to logs/session_YYYYMMDD_HHMMSS.json
+  3. Runs RiskGate + PositionSizer on each decision
+  4. Logs each decision + raw data snapshot via monitoring/logger.py
+  5. Prints a clean per-ticker summary as it goes
+  6. Prints a ranked confidence table at the end
+  7. Saves the full session (decisions + gate results + sizing) to
+     logs/session_YYYYMMDD_HHMMSS.json
 """
 
 import argparse
@@ -24,6 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -51,12 +54,14 @@ def _is_tty() -> bool:
 _USE_COLOUR = _is_tty()
 
 _C = {
-    "BUY":    "\033[92m",   # green
-    "SELL":   "\033[91m",   # red
-    "HOLD":   "\033[93m",   # yellow
-    "BOLD":   "\033[1m",
-    "DIM":    "\033[2m",
-    "RESET":  "\033[0m",
+    "BUY":      "\033[92m",   # green
+    "SELL":     "\033[91m",   # red
+    "HOLD":     "\033[93m",   # yellow
+    "APPROVED": "\033[92m",   # green
+    "BLOCKED":  "\033[91m",   # red
+    "BOLD":     "\033[1m",
+    "DIM":      "\033[2m",
+    "RESET":    "\033[0m",
 }
 
 def _col(text: str, key: str) -> str:
@@ -66,10 +71,23 @@ def _col(text: str, key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mock portfolio state — replaced by live Alpaca account state in Phase 5
+# ---------------------------------------------------------------------------
+
+_MOCK_PORTFOLIO: dict = {
+    "equity":          10_000.0,
+    "portfolio_value": 10_000.0,
+    "trades_today":    0,
+    "daily_pnl":       0.0,
+    "open_positions":  [],
+}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_watchlist() -> list[str]:
+def _load_watchlist() -> list:
     raw = os.getenv("WATCHLIST", "")
     tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
     if not tickers:
@@ -78,18 +96,23 @@ def _load_watchlist() -> list[str]:
     return tickers
 
 
-def _print_banner(tickers: list[str]) -> None:
+def _print_banner(tickers: list) -> None:
     width = 60
     print()
     print("=" * width)
-    print(_col(f"  AI Trading Bot — Analysis Session", "BOLD").center(width + 10))
+    print(_col("  AI Trading Bot — Analysis Session", "BOLD").center(width + 10))
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"  Tickers: {', '.join(tickers)}")
     print("=" * width)
     print()
 
 
-def _print_ticker_result(decision: dict, elapsed: float) -> None:
+def _print_ticker_result(
+    decision: dict,
+    gate_result: dict,
+    sizing: Optional[dict],
+    elapsed: float,
+) -> None:
     ticker     = decision["ticker"]
     action     = decision["action"]
     confidence = decision["confidence"]
@@ -106,70 +129,130 @@ def _print_ticker_result(decision: dict, elapsed: float) -> None:
         print(f"  {_col('Risks:    ', 'DIM')} {risk_flags[0][:90]}{'…' if len(risk_flags[0]) > 90 else ''}")
         for flag in risk_flags[1:]:
             print(f"             {flag[:90]}{'…' if len(flag) > 90 else ''}")
+
+    print()
+
+    # ── Risk gate / sizing output ─────────────────────────────────────
+    if gate_result["approved"] and sizing:
+        qty   = sizing["quantity"]
+        price = sizing["entry_price"]
+        val   = sizing["position_value"]
+        pct   = sizing["position_pct"] * 100
+        sl    = sizing["stop_loss_price"]
+        tp    = sizing["take_profit_price"]
+        risk  = sizing["risk_amount"]
+        print(
+            f"  {_col('APPROVED', 'APPROVED')}: "
+            f"{action} {qty} shares of {ticker} @ ${price:,.2f}"
+        )
+        print(f"  Position:   ${val:,.0f} ({pct:.1f}% of portfolio)")
+        print(f"  Stop loss:  ${sl:,.2f} | Take profit: ${tp:,.2f}")
+        print(f"  Risk:       ${risk:,.2f}")
+
+    elif gate_result["approved"] and not sizing:
+        print(
+            f"  {_col('APPROVED', 'APPROVED')}: {action} {ticker} "
+            f"(no price data — manual sizing required)"
+        )
+
+    elif gate_result["action"] == "HOLD":
+        print(f"  {_col('HOLD', 'HOLD')}: {gate_result['reason']}")
+
+    else:
+        print(f"  {_col('BLOCKED', 'BLOCKED')}: {gate_result['reason']}")
+
     print()
 
 
-def _print_summary_table(results: list[dict]) -> None:
-    sorted_results = sorted(results, key=lambda r: r["decision"]["confidence"], reverse=True)
+def _trade_plan_str(gate_result: dict, sizing: Optional[dict]) -> str:
+    """Compact one-liner for the summary table TRADE PLAN column."""
+    if gate_result.get("approved") and sizing:
+        return (
+            f"{sizing['quantity']} sh @ ${sizing['entry_price']:,.2f} | "
+            f"SL ${sizing['stop_loss_price']:,.2f} → TP ${sizing['take_profit_price']:,.2f}"
+        )
+    reason = gate_result.get("reason", "")
+    return reason[:50] + ("…" if len(reason) > 50 else "")
 
-    col_w = {"ticker": 10, "action": 6, "conf": 6, "risk": 44}
-    header = (
-        f"  {'TICKER':<{col_w['ticker']}}  "
-        f"{'ACTION':<{col_w['action']}}  "
-        f"{'CONF':>{col_w['conf']}}  "
-        f"{'TOP RISK FLAG':<{col_w['risk']}}"
+
+def _print_summary_table(results: list) -> None:
+    sorted_results = sorted(
+        results, key=lambda r: r["decision"]["confidence"], reverse=True
     )
-    divider = "  " + "─" * (sum(col_w.values()) + 8)
+
+    col = {"ticker": 8, "action": 6, "conf": 6, "status": 8, "plan": 52}
+    total_w = sum(col.values()) + 10   # gaps between columns
+
+    header = (
+        f"  {'TICKER':<{col['ticker']}}  "
+        f"{'ACTION':<{col['action']}}  "
+        f"{'CONF':>{col['conf']}}  "
+        f"{'STATUS':<{col['status']}}  "
+        f"{'TRADE PLAN':<{col['plan']}}"
+    )
+    divider = "  " + "─" * total_w
 
     print()
-    print("=" * 62)
+    print("=" * (total_w + 2))
     print(_col("  SESSION SUMMARY — ranked by confidence", "BOLD"))
-    print("=" * 62)
+    print("=" * (total_w + 2))
     print(_col(header, "DIM"))
     print(divider)
 
     for r in sorted_results:
-        d        = r["decision"]
-        ticker   = d["ticker"]
-        action   = d["action"]
-        conf     = d["confidence"]
-        flags    = d.get("risk_flags", [])
-        top_risk = flags[0][:col_w["risk"]] if flags else "—"
-        if len(flags[0]) > col_w["risk"] if flags else False:
-            top_risk = top_risk[: col_w["risk"] - 1] + "…"
+        d      = r["decision"]
+        gr     = r.get("gate_result", {})
+        sizing = r.get("sizing")
 
-        action_col = _col(f"{action:<{col_w['action']}}", action)
-        conf_str   = f"{conf:>{col_w['conf']}.1f}"
+        ticker = d["ticker"]
+        action = d["action"]
+        conf   = d["confidence"]
+
+        if gr.get("approved"):
+            status = "APPROVED"
+        else:
+            status = gr.get("action", "BLOCKED")   # "HOLD" or "BLOCKED"
+
+        plan = _trade_plan_str(gr, sizing)
+
+        action_col = _col(f"{action:<{col['action']}}", action)
+        status_col = _col(f"{status:<{col['status']}}", status)
+        conf_str   = f"{conf:>{col['conf']}.1f}"
 
         print(
-            f"  {ticker:<{col_w['ticker']}}  "
+            f"  {ticker:<{col['ticker']}}  "
             f"{action_col}  "
             f"{conf_str}  "
-            f"{top_risk}"
+            f"{status_col}  "
+            f"{plan}"
         )
 
     print(divider)
-    buy_count  = sum(1 for r in results if r["decision"]["action"] == "BUY")
-    hold_count = sum(1 for r in results if r["decision"]["action"] == "HOLD")
-    sell_count = sum(1 for r in results if r["decision"]["action"] == "SELL")
+    buy_count      = sum(1 for r in results if r["decision"]["action"] == "BUY")
+    hold_count     = sum(1 for r in results if r["decision"]["action"] == "HOLD")
+    sell_count     = sum(1 for r in results if r["decision"]["action"] == "SELL")
+    approved_count = sum(1 for r in results if r.get("gate_result", {}).get("approved"))
+    blocked_count  = len(results) - approved_count
     print(
-        f"  {_col(f'{buy_count} BUY', 'BUY')}  "
+        f"  Signals: {_col(f'{buy_count} BUY', 'BUY')}  "
         f"{_col(f'{hold_count} HOLD', 'HOLD')}  "
-        f"{_col(f'{sell_count} SELL', 'SELL')}"
+        f"{_col(f'{sell_count} SELL', 'SELL')}  ·  "
+        f"Gate: {_col(f'{approved_count} APPROVED', 'APPROVED')}  "
+        f"{_col(f'{blocked_count} BLOCKED', 'BLOCKED')}"
     )
     print()
 
 
-def _save_session(results: list[dict], session_ts: str) -> str:
+def _save_session(results: list, session_ts: str) -> str:
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
     path = logs_dir / f"session_{session_ts}.json"
 
     session = {
-        "session_id":  session_ts,
+        "session_id":   session_ts,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "ticker_count": len(results),
-        "results": results,
+        "results":      results,
     }
 
     with open(path, "w") as f:
@@ -180,60 +263,127 @@ def _save_session(results: list[dict], session_ts: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for error-path returns
+# ---------------------------------------------------------------------------
+
+def _error_decision(ticker: str, reasoning: str, flag: str) -> dict:
+    return {
+        "ticker":      ticker,
+        "action":      "HOLD",
+        "confidence":  1.0,
+        "reasoning":   reasoning,
+        "bull_case":   "",
+        "bear_case":   "",
+        "risk_flags":  [flag],
+        "analysed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _blocked_gate(decision: dict, reason: str) -> dict:
+    return {
+        "approved":          False,
+        "action":            "BLOCKED",
+        "reason":            reason,
+        "original_decision": decision,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Core per-ticker runner
 # ---------------------------------------------------------------------------
 
 def run_ticker(ticker: str) -> dict:
     """
-    Fetch data and run the full agent pipeline for one ticker.
-    Returns a dict: {"ticker", "decision", "market_data", "elapsed_seconds", "error"}.
+    Fetch data, run the full agent pipeline, then apply RiskGate + PositionSizer.
+
+    Returns:
+        {
+          ticker, decision, gate_result, sizing,
+          market_data, elapsed_seconds, error
+        }
     """
     from data.fetcher import DataFetcher
     from agents.trading_agents import TradingAgentsWrapper
     from monitoring.logger import log_decision
+    from risk.risk_gate import RiskGate
+    from risk.position_sizer import PositionSizer, PositionSizerError
 
     t0 = time.monotonic()
     logger.info("Starting analysis for %s", ticker)
 
+    # ── 1. Fetch market data ────────────────────────────────────────────
     try:
         data = DataFetcher().fetch(ticker)
     except Exception as exc:
         logger.error("[%s] DataFetcher failed: %s", ticker, exc, exc_info=True)
-        elapsed = time.monotonic() - t0
-        decision = {
-            "ticker":      ticker,
-            "action":      "HOLD",
-            "confidence":  1.0,
-            "reasoning":   f"Data fetch failed: {exc}",
-            "bull_case":   "",
-            "bear_case":   "",
-            "risk_flags":  [f"Data unavailable: {exc}"],
-            "analysed_at": datetime.now(timezone.utc).isoformat(),
+        decision = _error_decision(ticker, f"Data fetch failed: {exc}", str(exc))
+        return {
+            "ticker":          ticker,
+            "decision":        decision,
+            "gate_result":     _blocked_gate(decision, f"Data fetch failed: {exc}"),
+            "sizing":          None,
+            "market_data":     {},
+            "elapsed_seconds": time.monotonic() - t0,
+            "error":           str(exc),
         }
-        return {"ticker": ticker, "decision": decision, "market_data": {}, "elapsed_seconds": elapsed, "error": str(exc)}
 
+    # ── 2. Run 7-agent pipeline ─────────────────────────────────────────
     try:
-        wrapper  = TradingAgentsWrapper()
-        decision = wrapper.analyse(data)
+        decision = TradingAgentsWrapper().analyse(data)
     except Exception as exc:
         logger.error("[%s] Agent pipeline failed: %s", ticker, exc, exc_info=True)
-        elapsed = time.monotonic() - t0
-        decision = {
-            "ticker":      ticker,
-            "action":      "HOLD",
-            "confidence":  1.0,
-            "reasoning":   f"Agent pipeline failed: {exc}",
-            "bull_case":   "",
-            "bear_case":   "",
-            "risk_flags":  [f"Pipeline error: {exc}"],
-            "analysed_at": datetime.now(timezone.utc).isoformat(),
+        decision = _error_decision(ticker, f"Agent pipeline failed: {exc}", str(exc))
+        return {
+            "ticker":          ticker,
+            "decision":        decision,
+            "gate_result":     _blocked_gate(decision, f"Agent pipeline failed: {exc}"),
+            "sizing":          None,
+            "market_data":     data,
+            "elapsed_seconds": time.monotonic() - t0,
+            "error":           str(exc),
         }
-        return {"ticker": ticker, "decision": decision, "market_data": data, "elapsed_seconds": time.monotonic() - t0, "error": str(exc)}
 
     elapsed = time.monotonic() - t0
     log_decision(ticker, decision, data)
 
-    return {"ticker": ticker, "decision": decision, "market_data": data, "elapsed_seconds": elapsed, "error": None}
+    # ── 3. Risk Gate ────────────────────────────────────────────────────
+    gate_result = RiskGate().check(decision, _MOCK_PORTFOLIO)
+
+    # ── 4. Position Sizer (approved BUY / SELL only) ─────────────────────
+    sizing = None
+    if gate_result["approved"] and decision["action"] in ("BUY", "SELL"):
+        entry_price = (data.get("quote") or {}).get("price")
+        if entry_price is not None:
+            try:
+                sizing = PositionSizer().calculate(
+                    ticker=ticker,
+                    action=decision["action"],
+                    entry_price=float(entry_price),
+                    portfolio_value=_MOCK_PORTFOLIO["portfolio_value"],
+                    confidence=decision["confidence"],
+                )
+            except PositionSizerError as exc:
+                logger.warning("[%s] PositionSizer blocked trade: %s", ticker, exc)
+                gate_result = {
+                    **gate_result,
+                    "approved": False,
+                    "action":   "BLOCKED",
+                    "reason":   str(exc),
+                }
+        else:
+            logger.warning(
+                "[%s] Quote price unavailable — position sizing skipped", ticker
+            )
+
+    return {
+        "ticker":          ticker,
+        "decision":        decision,
+        "gate_result":     gate_result,
+        "sizing":          sizing,
+        "market_data":     data,
+        "elapsed_seconds": elapsed,
+        "error":           None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -266,37 +416,39 @@ Examples:
     )
 
     args = parser.parse_args()
-
-    if args.watchlist:
-        tickers = _load_watchlist()
-    else:
-        tickers = [t.upper() for t in args.ticker]
+    tickers = _load_watchlist() if args.watchlist else [t.upper() for t in args.ticker]
 
     session_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     _print_banner(tickers)
 
-    results: list[dict] = []
-    failed: list[str]   = []
+    results: list = []
+    failed:  list = []
 
     for i, ticker in enumerate(tickers, start=1):
         print(f"  [{i}/{len(tickers)}] Analysing {_col(ticker, 'BOLD')}...")
         result = run_ticker(ticker)
         results.append(result)
 
-        _print_ticker_result(result["decision"], result["elapsed_seconds"])
+        _print_ticker_result(
+            result["decision"],
+            result["gate_result"],
+            result.get("sizing"),
+            result["elapsed_seconds"],
+        )
 
         if result["error"]:
             failed.append(ticker)
 
-    # Summary table
     _print_summary_table(results)
 
-    # Save session JSON
     session_path = _save_session(results, session_ts)
     print(f"  Full session saved → {_col(session_path, 'DIM')}")
 
     if failed:
-        print(f"\n  {_col('Errors:', 'SELL')} {', '.join(failed)} failed — check logs above.\n")
+        print(
+            f"\n  {_col('Errors:', 'SELL')} "
+            f"{', '.join(failed)} failed — check logs above.\n"
+        )
         sys.exit(1)
 
     print()
