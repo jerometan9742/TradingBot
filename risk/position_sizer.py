@@ -26,6 +26,7 @@ Usage:
 import logging
 import math
 import os
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -96,7 +97,7 @@ class PositionSizer:
             ticker:          Stock symbol, e.g. "AAPL"
             action:          "BUY" or "SELL"
             entry_price:     Current market price per share
-            portfolio_value: Total account equity in dollars
+            portfolio_value: Fallback equity if live MooMoo fetch fails
             confidence:      Agent confidence score, 7.0 – 10.0
 
         Returns:
@@ -108,6 +109,20 @@ class PositionSizer:
         """
         action = action.upper()
         self._validate_inputs(ticker, action, entry_price, portfolio_value, confidence)
+
+        # Prefer live US account equity from MooMoo; fall back to passed-in value
+        live_pv = self._live_portfolio_value()
+        if live_pv is not None:
+            logger.info(
+                "[PositionSizer] Live MooMoo US equity: $%.2f (fallback was $%.2f)",
+                live_pv, portfolio_value,
+            )
+            portfolio_value = live_pv
+        else:
+            logger.info(
+                "[PositionSizer] MooMoo unavailable — using fallback portfolio_value: $%.2f",
+                portfolio_value,
+            )
 
         logger.info(
             "[PositionSizer] Sizing %s %s @ $%.2f  portfolio=$%.2f  confidence=%.1f",
@@ -192,6 +207,28 @@ class PositionSizer:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _live_portfolio_value(self) -> Optional[float]:
+        """
+        Fetch US market total_assets (USD) from MooMoo as live equity.
+
+        Only attempted when BROKER=moomoo. Returns None if FutuOpenD is
+        unreachable, trade is not unlocked, or the US balance is zero —
+        callers fall back to the passed-in portfolio_value in all these cases.
+        """
+        if os.getenv("BROKER", "moomoo").lower() != "moomoo":
+            return None
+        try:
+            from execution.moomoo import MooMooConnector
+            with MooMooConnector() as conn:
+                balance = conn.get_account_balance()
+            value = float(
+                balance.get("by_market", {}).get("US", {}).get("total_assets", 0) or 0
+            )
+            return value if value > 0 else None
+        except Exception as exc:
+            logger.warning("[PositionSizer] MooMoo equity fetch failed: %s", exc)
+            return None
 
     def _levels(self, action: str, entry_price: float):
         """Return (stop_loss_price, take_profit_price) for BUY or SELL."""
