@@ -243,6 +243,105 @@ class TelegramAlerter:
         """Alert: the kill switch was activated (alias for send_kill_switch_triggered)."""
         return self.send_kill_switch_triggered(reason)
 
+    def send_premarket_scan(
+        self,
+        ticker: str,
+        signal: str,
+        confidence: float,
+    ) -> bool:
+        """Alert: pre-market per-ticker scan result."""
+        text = (
+            f"📊 <b>Pre-market scan: {ticker}</b>\n"
+            f"Signal: <b>{signal}</b>  ({confidence:.1f}/10)\n"
+            f"Time: {_now_sgt()}"
+        )
+        return self._send(text)
+
+    def send_premarket_trade_placed(
+        self,
+        ticker: str,
+        action: str,
+        quantity: int,
+        order_id: str,
+    ) -> bool:
+        """Alert: high-confidence pre-market trade placed."""
+        text = (
+            f"⚡ <b>High confidence pre-market trade placed</b>\n\n"
+            f"{action} <b>{quantity:,} × {ticker}</b>\n"
+            f"Order ID: <code>{order_id}</code>\n"
+            f"Time: {_now_sgt()}"
+        )
+        return self._send(text)
+
+    def send_order_cancelled(
+        self,
+        ticker: str,
+        action: str,
+        quantity: int,
+        order_id: str,
+    ) -> bool:
+        """Alert: an order was cancelled."""
+        text = (
+            f"❌ <b>Order Cancelled: {ticker}</b>\n\n"
+            f"{action} {quantity:,} × {ticker} — cancelled manually or expired\n"
+            f"Order ID: <code>{order_id}</code>\n"
+            f"Time: {_now_sgt()}"
+        )
+        return self._send(text)
+
+    def send_order_rejected(
+        self,
+        ticker: str,
+        action: str,
+        quantity: int,
+        order_id: str,
+        reason: str = "",
+    ) -> bool:
+        """Alert: an order was rejected by the broker."""
+        text = (
+            f"⚠️ <b>Order Rejected: {ticker}</b>\n\n"
+            f"{action} {quantity:,} × {ticker}\n"
+            f"Reason: {reason or 'unknown'}\n"
+            f"Order ID: <code>{order_id}</code>\n"
+            f"Time: {_now_sgt()}"
+        )
+        return self._send(text)
+
+    def send_market_close_summary(
+        self,
+        portfolio_state: dict,
+        positions: list,
+    ) -> bool:
+        """Alert: market close P&L summary (04:00 SGT)."""
+        equity     = portfolio_state.get("equity", 0.0)
+        daily_pnl  = portfolio_state.get("daily_pnl", 0.0)
+        trades_today = portfolio_state.get("trades_today", 0)
+
+        pnl_icon = "📈" if daily_pnl >= 0 else "📉"
+        pnl_sign = "+" if daily_pnl >= 0 else ""
+
+        lines = [
+            f"{pnl_icon} <b>Market Close Summary</b>",
+            f"",
+            f"Equity:       ${equity:,.2f}",
+            f"Daily P&amp;L:    {pnl_sign}${daily_pnl:,.2f}",
+            f"Trades today: {trades_today}",
+            f"Open positions: {len(positions)}",
+        ]
+
+        if positions:
+            lines.append("")
+            lines.append("<b>Open Positions:</b>")
+            for p in positions:
+                t   = p.get("ticker", "?")
+                qty = p.get("quantity", 0)
+                pnl = p.get("unrealised_pnl", 0.0)
+                sign = "+" if pnl >= 0 else ""
+                lines.append(f"  {t}: {qty:,} shares  ({sign}${pnl:,.2f})")
+
+        lines.append(f"\nTime: {_now_sgt()}")
+        return self._send("\n".join(lines))
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -333,6 +432,32 @@ def send_cycle_complete(label: str, approved: int, blocked: int) -> bool:
 
 def send_kill_switch_triggered(reason: str) -> bool:
     return _alerter().send_kill_switch_triggered(reason)
+
+
+def send_premarket_scan(ticker: str, signal: str, confidence: float) -> bool:
+    return _alerter().send_premarket_scan(ticker, signal, confidence)
+
+
+def send_premarket_trade_placed(
+    ticker: str, action: str, quantity: int, order_id: str
+) -> bool:
+    return _alerter().send_premarket_trade_placed(ticker, action, quantity, order_id)
+
+
+def send_order_cancelled(
+    ticker: str, action: str, quantity: int, order_id: str
+) -> bool:
+    return _alerter().send_order_cancelled(ticker, action, quantity, order_id)
+
+
+def send_order_rejected(
+    ticker: str, action: str, quantity: int, order_id: str, reason: str = ""
+) -> bool:
+    return _alerter().send_order_rejected(ticker, action, quantity, order_id, reason)
+
+
+def send_market_close_summary(portfolio_state: dict, positions: list) -> bool:
+    return _alerter().send_market_close_summary(portfolio_state, positions)
 
 
 # ---------------------------------------------------------------------------
