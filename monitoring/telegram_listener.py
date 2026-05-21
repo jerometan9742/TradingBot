@@ -784,15 +784,26 @@ class TelegramCommandListener:
             ticker  = p.get("display_ticker") or _display_ticker(p.get("ticker", ""))
             qty     = p.get("quantity", 0)
             entry   = p.get("entry_price", 0.0)
-            current = p.get("current_price", 0.0)
-            upnl    = p.get("unrealised_pnl", 0.0)
             tpnl    = p.get("today_pnl", 0.0)
+
+            current = p.get("current_price") or 0.0
+            price_label = ""
+            if current <= 0:
+                current, price_label = self._fetch_price_with_fallback(ticker, entry)
+
+            # Always recalculate from first principles instead of trusting MooMoo's pl_val
+            if entry > 0 and current > 0:
+                upnl = (current - entry) * qty
+            else:
+                upnl = p.get("unrealised_pnl", 0.0)
+
             total_upnl += upnl
+            price_str = f"${current:,.2f}" + (f" {price_label}" if price_label else "")
 
             lines.append(
                 f"\n{i}. <b>{ticker}</b> — {qty:,} share{'s' if qty != 1 else ''}\n"
                 f"   Avg Cost:    ${entry:,.2f}\n"
-                f"   Current:     ${current:,.2f}\n"
+                f"   Current:     {price_str}\n"
                 f"   Unreal P&amp;L: ${_sign(upnl)}{upnl:,.2f}\n"
                 f"   Today P&amp;L:  ${_sign(tpnl)}{tpnl:,.2f}"
             )
@@ -1394,6 +1405,38 @@ class TelegramCommandListener:
             )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _fetch_price_with_fallback(
+        self, ticker: str, last_known: float
+    ) -> tuple[float, str]:
+        """
+        Fetch a live price from Finnhub when MooMoo returns $0.00.
+
+        Returns (price, label) where label is:
+          ""             — fresh Finnhub price
+          "(last known)" — Finnhub unavailable; using last_known (entry price)
+        """
+        try:
+            from data.finnhub import FinnhubClient
+            quote = FinnhubClient().get_quote(ticker)
+            price = float(quote.get("c") or 0)
+            if price > 0:
+                logger.debug(
+                    "[TelegramListener] Finnhub price fallback: %s → $%.2f", ticker, price
+                )
+                return price, ""
+        except Exception as exc:
+            logger.warning(
+                "[TelegramListener] Finnhub price fetch failed for %s: %s", ticker, exc
+            )
+
+        if last_known > 0:
+            logger.warning(
+                "[TelegramListener] Using entry price as last-known for %s: $%.2f",
+                ticker, last_known,
+            )
+            return last_known, "(last known)"
+        return 0.0, ""
 
     def _make_executor(self):
         from execution.moomoo import MooMooConnector
