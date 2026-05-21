@@ -20,7 +20,7 @@ build/
 # Logs & data
 *.log
 logs/
-agents/memory/*.json
+agents/memory/
 
 # IDE
 .vscode/
@@ -29,6 +29,9 @@ agents/memory/*.json
 *.swo
 .DS_Store
 
+# Claude Code project files (memory, settings)
+.claude/
+
 # Docker
 .docker/
 
@@ -36,6 +39,9 @@ agents/memory/*.json
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Personal watchlist (edit locally, not committed)
+watchlist.txt
 
 # Secrets (never commit these)
 *.pem

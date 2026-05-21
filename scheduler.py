@@ -239,10 +239,10 @@ class TradingScheduler:
     # ------------------------------------------------------------------
 
     def _load_watchlist(self) -> list:
-        raw = os.getenv("WATCHLIST", "")
-        tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+        from monitoring.watchlist import WatchlistManager
+        tickers = WatchlistManager().get_tickers()
         if not tickers:
-            logger.error("[TradingScheduler] WATCHLIST is empty or not set in .env")
+            logger.error("[TradingScheduler] Watchlist is empty — check watchlist.txt")
         return tickers
 
     def _make_executor(self):
