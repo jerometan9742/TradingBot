@@ -126,19 +126,28 @@ st.markdown("""
 
 @st.cache_resource
 def _make_executor():
-    """Create AlpacaExecutor once per dashboard process. Returns None if unconfigured."""
-    api_key = os.getenv("ALPACA_API_KEY", "")
-    sec_key = os.getenv("ALPACA_SECRET_KEY", "")
-    if not api_key or api_key in ("", "your-key-here"):
-        return None
-    if not sec_key or sec_key in ("", "your-key-here"):
-        return None
-    try:
-        from execution.alpaca import AlpacaExecutor
-        return AlpacaExecutor()
-    except Exception as exc:
-        logger.warning("AlpacaExecutor init failed: %s", exc)
-        return None
+    """Create the configured broker connector once per dashboard process."""
+    broker = os.getenv("BROKER", "moomoo").lower()
+    if broker == "moomoo":
+        try:
+            from execution.moomoo import MooMooConnector
+            return MooMooConnector()
+        except Exception as exc:
+            logger.warning("MooMooConnector init failed: %s", exc)
+            return None
+    else:
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        sec_key = os.getenv("ALPACA_SECRET_KEY", "")
+        if not api_key or api_key in ("", "your-key-here"):
+            return None
+        if not sec_key or sec_key in ("", "your-key-here"):
+            return None
+        try:
+            from execution.alpaca import AlpacaExecutor
+            return AlpacaExecutor()
+        except Exception as exc:
+            logger.warning("AlpacaExecutor init failed: %s", exc)
+            return None
 
 
 def _executor():
@@ -147,12 +156,34 @@ def _executor():
 
 def _get_account() -> Optional[dict]:
     ex = _executor()
-    return ex.get_account() if ex else None
+    if ex is None:
+        return None
+    try:
+        if hasattr(ex, "get_account_balance"):
+            bal = ex.get_account_balance()
+            pv  = bal.get("portfolio_value", 0.0)
+            return {
+                "equity":         pv,
+                "cash":           bal.get("cash", 0.0),
+                "buying_power":   bal.get("cash", 0.0),
+                "daily_pnl":      0.0,
+                "unrealised_pnl": bal.get("market_value", 0.0),
+            }
+        return ex.get_account()
+    except Exception as exc:
+        logger.warning("get_account failed: %s", exc)
+        return None
 
 
 def _get_positions() -> list:
     ex = _executor()
-    return ex.get_positions() if ex else []
+    if ex is None:
+        return []
+    try:
+        return ex.get_positions()
+    except Exception as exc:
+        logger.warning("get_positions failed: %s", exc)
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -425,10 +456,17 @@ def page_open_positions():
     st.title("📋 Open Positions")
 
     if not _executor():
-        st.info(
-            "Alpaca not configured — set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` "
-            "in `.env` to see live positions."
-        )
+        broker = os.getenv("BROKER", "moomoo").lower()
+        if broker == "moomoo":
+            st.info(
+                "MooMoo not connected — start FutuOpenD and ensure "
+                "`MOOMOO_HOST` / `MOOMOO_PORT` are set in `.env`."
+            )
+        else:
+            st.info(
+                "Alpaca not configured — set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` "
+                "in `.env` to see live positions."
+            )
         return
 
     positions = _get_positions()
@@ -512,9 +550,18 @@ def page_open_positions():
                 ):
                     ex = _executor()
                     with st.spinner(f"Closing {ticker}…"):
-                        order = ex.close_position(ticker)
+                        try:
+                            if hasattr(ex, "close_position"):
+                                order = ex.close_position(ticker)
+                                oid = order.get("id") if order else None
+                            else:
+                                order = ex.place_order(ticker, "sell", int(qty))
+                                oid = order.get("order_id") if order else None
+                        except Exception as exc:
+                            order = None
+                            logger.warning("Close %s failed: %s", ticker, exc)
                     if order:
-                        st.success(f"Close order placed — id: {order.get('id')}")
+                        st.success(f"Close order placed — id: {oid}")
                         st.cache_resource.clear()
                         st.rerun()
                     else:
@@ -1115,12 +1162,14 @@ def page_settings():
 
     # ── API status panel ───────────────────────────────────────────────────
     st.subheader("API Status")
+    _broker = os.getenv("BROKER", "moomoo").lower()
+    broker_entry = ("MooMoo", "MOOMOO_HOST") if _broker == "moomoo" else ("Alpaca", "ALPACA_API_KEY")
     apis = [
         ("Anthropic",     "ANTHROPIC_API_KEY"),
         ("Alpha Vantage", "ALPHA_VANTAGE_API_KEY"),
         ("Finnhub",       "FINNHUB_API_KEY"),
         ("FMP",           "FMP_API_KEY"),
-        ("Alpaca",        "ALPACA_API_KEY"),
+        broker_entry,
         ("Telegram",      "TELEGRAM_BOT_TOKEN"),
     ]
     cols = st.columns(len(apis))
@@ -1131,19 +1180,22 @@ def page_settings():
         col.metric(name, "✅" if configured else "⚠️", masked)
 
     st.markdown("")
-    if st.button("Test Alpaca Connection"):
-        ex = _executor()
-        if ex is None:
-            st.error("Alpaca not configured — check ALPACA_API_KEY / ALPACA_SECRET_KEY in .env")
+    btn_label = "Test MooMoo Connection" if _broker == "moomoo" else "Test Alpaca Connection"
+    if st.button(btn_label):
+        acct = _get_account()
+        if acct:
+            mode = os.getenv("TRADING_MODE", "paper").upper()
+            st.success(f"Connected ✓  equity=${acct['equity']:,.2f}  mode={mode}")
         else:
-            acct = ex.get_account()
-            if acct:
-                mode = os.getenv("TRADING_MODE", "paper").upper()
-                st.success(
-                    f"Connected ✓  equity=${acct['equity']:,.2f}  mode={mode}"
+            if _broker == "moomoo":
+                host = os.getenv("MOOMOO_HOST", "127.0.0.1")
+                port = os.getenv("MOOMOO_PORT", "11111")
+                st.error(
+                    f"MooMoo unreachable — check FutuOpenD is running at {host}:{port} "
+                    "and trading is unlocked."
                 )
             else:
-                st.error("Keys set but API call failed — check credentials and network")
+                st.error("Alpaca not configured — check ALPACA_API_KEY / ALPACA_SECRET_KEY in .env")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
