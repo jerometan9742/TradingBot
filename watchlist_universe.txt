@@ -1,0 +1,29 @@
+# Screening universe — tickers evaluated daily by data/screener.py
+# Top candidates are sent to Telegram at 19:00 SGT
+# Use /add TICKER in Telegram to promote to the active watchlist.txt
+
+AAPL
+MSFT
+NVDA
+META
+GOOGL
+AMZN
+TSLA
+AMD
+NFLX
+CRM
+ORCL
+ADBE
+INTC
+QCOM
+MU
+AVGO
+ARM
+PLTR
+SNOW
+UBER
+LYFT
+COIN
+SQ
+PYPL
+SHOP

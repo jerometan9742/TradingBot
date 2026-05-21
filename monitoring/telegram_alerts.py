@@ -307,6 +307,37 @@ class TelegramAlerter:
         )
         return self._send(text)
 
+    def send_screener_results(self, results: list) -> bool:
+        """
+        Alert: daily momentum screener top-15 candidates.
+
+        Args:
+            results: list of dicts with keys ticker, score, change_5d,
+                     volume_ratio, rsi_14 — sorted highest score first.
+        """
+        lines = [
+            "🔍 <b>Daily Screen — Top 15 Candidates</b>",
+            "Sorted by momentum score:",
+            "",
+        ]
+        for i, r in enumerate(results[:15], 1):
+            ticker    = r["ticker"]
+            score     = r["score"]
+            rsi       = r.get("rsi_14", 0.0)
+            vol_ratio = r.get("volume_ratio", 0.0)
+            change_5d = r.get("change_5d", 0.0)
+            arrow     = "▲" if change_5d >= 0 else "▼"
+            lines.append(
+                f"{i:>2}. <b>{ticker:<5}</b>  {arrow} {score:.1f}/10  "
+                f"RSI:{rsi:.0f}  Vol:{vol_ratio:.1f}x avg"
+            )
+        lines.extend([
+            "",
+            "Reply: /add NVDA META to add to watchlist",
+            "Reply: /remove TSLA to remove from watchlist",
+        ])
+        return self._send("\n".join(lines))
+
     def send_market_close_summary(
         self,
         portfolio_state: dict,
@@ -458,6 +489,10 @@ def send_order_rejected(
 
 def send_market_close_summary(portfolio_state: dict, positions: list) -> bool:
     return _alerter().send_market_close_summary(portfolio_state, positions)
+
+
+def send_screener_results(results: list) -> bool:
+    return _alerter().send_screener_results(results)
 
 
 # ---------------------------------------------------------------------------
