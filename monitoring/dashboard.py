@@ -22,6 +22,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -42,8 +43,52 @@ KILL_SWITCH = _ROOT / "kill_switch.lock"
 ENV_FILE    = _ROOT / ".env"
 TRADES_CSV  = LOGS_DIR / "trades.csv"
 
+_SGT = ZoneInfo("Asia/Singapore")
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("dashboard")
+
+
+# All scheduled jobs in (hour, minute, display_label) order.
+# Keep in sync with scheduler.py if the schedule changes.
+_SCHEDULE = [
+    (8,  50, "Reset counters"),
+    (9,   0, "SGX open analysis"),
+    (15,  0, "SGX close analysis"),
+    (21, 30, "NYSE open analysis"),
+]
+
+
+def _next_scheduled_run() -> tuple:
+    """Return (next_datetime_sgt, label) for the next upcoming scheduled job."""
+    now = datetime.now(_SGT)
+    for day_offset in range(8):
+        day = now + timedelta(days=day_offset)
+        if day.weekday() >= 5:   # skip Saturday (5) and Sunday (6)
+            continue
+        for hour, minute, label in _SCHEDULE:
+            t = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if t > now:
+                return t, label
+    # Fallback: next Monday 08:50 (should never be reached within 8 days)
+    days_ahead = (7 - now.weekday()) % 7 or 7
+    t = (now + timedelta(days=days_ahead)).replace(
+        hour=8, minute=50, second=0, microsecond=0
+    )
+    return t, "Reset counters"
+
+
+def _iso_to_sgt(ts_str: str, fmt: str = "%Y-%m-%d %H:%M SGT") -> str:
+    """Parse an ISO UTC timestamp string and return it formatted in SGT."""
+    if not ts_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_SGT).strftime(fmt)
+    except Exception:
+        return ts_str[:16].replace("T", " ")
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -142,7 +187,7 @@ def _list_sessions() -> list:
     for f in files:
         try:
             ts    = datetime.strptime(f.stem[8:], "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-            label = ts.strftime("%Y-%m-%d %H:%M UTC")
+            label = ts.astimezone(_SGT).strftime("%Y-%m-%d %H:%M SGT")
         except Exception:
             label = f.stem
         result.append((label, f))
@@ -254,7 +299,7 @@ def page_live_overview():
             '<script>setTimeout(function(){window.location.reload()}, 60000);</script>',
             height=0,
         )
-        st.caption(f"Refreshing every 60s · loaded {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"Refreshing every 60s · loaded {datetime.now(_SGT).strftime('%H:%M:%S SGT')}")
 
     # ── Account Summary ────────────────────────────────────────────────────
     st.subheader("Account Summary")
@@ -317,19 +362,9 @@ def page_live_overview():
         st.caption(sessions[0][0] if sessions else "No sessions yet")
 
     with c3:
-        from zoneinfo import ZoneInfo
-        _SGT = ZoneInfo("Asia/Singapore")
-        now_sgt = datetime.now(_SGT)
-        candidates = [
-            now_sgt.replace(hour=9,  minute=0, second=0, microsecond=0),
-            now_sgt.replace(hour=15, minute=0, second=0, microsecond=0),
-        ]
-        future = [t for t in candidates if t > now_sgt]
-        next_run = future[0] if future else (
-            (now_sgt + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        )
+        next_run, next_label = _next_scheduled_run()
         st.markdown("**Next Scheduled Run**")
-        st.caption(next_run.strftime("%Y-%m-%d %H:%M SGT"))
+        st.caption(f"{next_run.strftime('%Y-%m-%d %H:%M SGT')} — {next_label}")
 
     with c4:
         mode = os.getenv("TRADING_MODE", "paper").upper()
@@ -366,10 +401,7 @@ def page_live_overview():
                 "Signal":        d.get("action", "—"),
                 "Confidence":    f"{d.get('confidence', 0):.1f}/10",
                 "Gate":          gate_status,
-                "Last Analysed": (
-                    d.get("analysed_at", "")[:16].replace("T", " ") + " UTC"
-                    if d.get("analysed_at") else "—"
-                ),
+                "Last Analysed": _iso_to_sgt(d.get("analysed_at", "")),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     elif watchlist:
@@ -562,7 +594,10 @@ def page_trade_history():
     # ── Raw trade log ──────────────────────────────────────────────────────
     st.subheader(f"Trade Log  ({len(df)} entries)")
     display = df.copy().sort_values("timestamp", ascending=False)
-    display["timestamp"] = display["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    ts_col = display["timestamp"]
+    if ts_col.dt.tz is None:
+        ts_col = ts_col.dt.tz_localize("UTC")
+    display["timestamp"] = ts_col.dt.tz_convert("Asia/Singapore").dt.strftime("%Y-%m-%d %H:%M:%S SGT")
     display["price"]     = display["price"].map("${:,.2f}".format)
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -592,7 +627,7 @@ def page_bot_decisions():
     st.caption(
         f"Session `{data.get('session_id', '')}` · "
         f"{data.get('ticker_count', len(results))} ticker(s) · "
-        f"generated {data.get('generated_at', '')[:16].replace('T', ' ')} UTC"
+        f"generated {_iso_to_sgt(data.get('generated_at', ''))}"
     )
 
     for r in results:
