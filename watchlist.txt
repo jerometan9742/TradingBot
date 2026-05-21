@@ -4,7 +4,6 @@ MSFT
 NVDA
 MU
 AMD
-TSLA
 META
 
 # US Finance
