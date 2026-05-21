@@ -2,9 +2,10 @@
 scheduler.py — APScheduler-driven pipeline runner for the AI trading bot.
 
 Schedule (SGT / Asia/Singapore):
-    08:50  Mon-Fri   reset_daily_state()         — clear counters before open
-    09:00  Mon-Fri   run_analysis_cycle("open")  — market-open analysis
-    15:00  Mon-Fri   run_analysis_cycle("close") — pre-close analysis
+    08:50  Mon-Fri   reset_daily_state()              — clear counters before open
+    09:00  Mon-Fri   run_analysis_cycle("open")       — SGX market-open analysis
+    15:00  Mon-Fri   run_analysis_cycle("close")      — SGX pre-close analysis
+    21:30  Mon-Fri   run_analysis_cycle("ny_open")    — NYSE open, US tickers only
 
 Usage:
     python scheduler.py              # start the scheduler (blocking)
@@ -94,8 +95,9 @@ class TradingScheduler:
 
         Jobs registered:
             08:50 SGT Mon-Fri  reset_daily_state()
-            09:00 SGT Mon-Fri  run_analysis_cycle("open")
-            15:00 SGT Mon-Fri  run_analysis_cycle("close")
+            09:00 SGT Mon-Fri  run_analysis_cycle("open")      — full watchlist
+            15:00 SGT Mon-Fri  run_analysis_cycle("close")     — full watchlist
+            21:30 SGT Mon-Fri  run_analysis_cycle("ny_open")   — US tickers only
         """
         self._apscheduler = BlockingScheduler(timezone=_TZ_SCHED)
 
@@ -113,7 +115,7 @@ class TradingScheduler:
             trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0,
                                 timezone=_TZ_SCHED),
             id="analysis_open",
-            name="Market-open analysis (09:00 SGT)",
+            name="SGX market-open analysis (09:00 SGT)",
             replace_existing=True,
             misfire_grace_time=300,
         )
@@ -122,7 +124,19 @@ class TradingScheduler:
             trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=0,
                                 timezone=_TZ_SCHED),
             id="analysis_close",
-            name="Pre-close analysis (15:00 SGT)",
+            name="SGX pre-close analysis (15:00 SGT)",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        self._apscheduler.add_job(
+            func=lambda: self.run_analysis_cycle(
+                "ny_open",
+                tickers_override=self._us_tickers(),
+            ),
+            trigger=CronTrigger(day_of_week="mon-fri", hour=21, minute=30,
+                                timezone=_TZ_SCHED),
+            id="analysis_ny_open",
+            name="NYSE market-open analysis (21:30 SGT)",
             replace_existing=True,
             misfire_grace_time=300,
         )
@@ -154,16 +168,26 @@ class TradingScheduler:
             datetime.now(_SGT).strftime("%Y-%m-%d %H:%M:%S SGT"),
         )
 
-    def run_analysis_cycle(self, label: str = "scheduled") -> None:
+    def run_analysis_cycle(
+        self,
+        label: str = "scheduled",
+        tickers_override: list | None = None,
+    ) -> None:
         """
         Full watchlist analysis cycle.
 
+        Args:
+            label:            Descriptive label logged with each cycle
+                              ("open", "close", "ny_open", "manual", …).
+            tickers_override: When provided, analyse only these tickers instead
+                              of the full watchlist.  Used by the NYSE-open job
+                              to restrict the cycle to US-listed symbols.
+
         Steps:
-            1. Connect to Alpaca (skip order execution if keys not configured)
-            2. Check US market is open — skip cycle if closed
-            3. Refresh portfolio state from Alpaca
-            4. Run per-ticker pipeline for every ticker in WATCHLIST
-            5. Send Telegram cycle summary
+            1. Connect to broker (order execution disabled if keys not configured)
+            2. Refresh portfolio state
+            3. Run per-ticker pipeline for every ticker in the watchlist
+            4. Send Telegram cycle summary
         """
         started_at = datetime.now(_SGT).strftime("%Y-%m-%d %H:%M:%S SGT")
         logger.info("=" * 60)
@@ -172,28 +196,9 @@ class TradingScheduler:
         logger.info("=" * 60)
 
         executor = self._make_executor()
-
-        # Market-open check
-        if executor is not None:
-            try:
-                if not executor.is_market_open():
-                    logger.warning(
-                        "[TradingScheduler] US market closed — skipping [%s]", label
-                    )
-                    return
-                logger.info("[TradingScheduler] Market is open — proceeding")
-            except Exception as exc:
-                logger.warning(
-                    "[TradingScheduler] is_market_open() error (%s) — proceeding", exc
-                )
-        else:
-            logger.warning(
-                "[TradingScheduler] No broker — market-open check skipped"
-            )
-
         self._refresh_portfolio(executor)
 
-        tickers = self._load_watchlist()
+        tickers = tickers_override if tickers_override is not None else self._load_watchlist()
         if not tickers:
             logger.error("[TradingScheduler] Empty watchlist — aborting cycle")
             return
@@ -237,6 +242,10 @@ class TradingScheduler:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _us_tickers(self) -> list:
+        """Return only US-listed tickers (no dot suffix, e.g. AAPL not D05.SI)."""
+        return [t for t in self._load_watchlist() if "." not in t]
 
     def _load_watchlist(self) -> list:
         from monitoring.watchlist import WatchlistManager
