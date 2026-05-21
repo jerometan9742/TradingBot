@@ -220,6 +220,7 @@ class TelegramCommandListener:
             elif cmd == "/chart":       self._cmd_chart(args)
             elif cmd == "/summary":     self._cmd_summary()
             elif cmd == "/history":     self._cmd_history()
+            elif cmd == "/stats":       self._cmd_stats()
             elif cmd == "/status":      self._cmd_status()
             elif cmd == "/orders":      self._cmd_orders()
             elif cmd == "/positions":   self._cmd_positions()
@@ -267,6 +268,7 @@ class TelegramCommandListener:
             "/chart TICKER — technical indicators\n"
             "/summary — full account snapshot\n"
             "/history — last 10 closed trades\n"
+            "/stats — performance stats (win rate, P&amp;L, Sharpe)\n"
             "/status — VPS service status\n"
             "/cash — available cash\n"
             "/positions — open positions with P&amp;L\n"
@@ -579,6 +581,130 @@ class TelegramCommandListener:
             except (ValueError, TypeError):
                 price_str = row.get("price", "?")
             lines.append(f"{i}. {ticker} {action} {qty}x @ {price_str} | {ts}")
+
+        self._reply("\n".join(lines))
+
+    def _cmd_stats(self) -> None:
+        if not _TRADES_CSV.exists():
+            self._reply("📊 No trade history yet.")
+            return
+
+        rows: list = []
+        try:
+            with open(_TRADES_CSV, newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception as exc:
+            self._reply(f"❌ Could not read trade history: {exc}")
+            return
+
+        if not rows:
+            self._reply("📊 No trade history yet.")
+            return
+
+        # ── Parse BUY/SELL entries, FIFO-match round trips ────────────
+        total_placed = 0
+        buy_queue: dict[str, list] = {}   # ticker → [(qty, price), ...]
+        closed: list[tuple]        = []   # [(ticker, pnl), ...]
+
+        for row in rows:
+            action = (row.get("action") or "").upper().strip()
+            ticker = (row.get("ticker") or "").strip()
+            try:
+                qty   = float(row.get("quantity") or 0)
+                price = float(row.get("price")    or 0)
+            except (ValueError, TypeError):
+                continue
+
+            if qty <= 0 or not ticker or price <= 0:
+                continue
+
+            if action == "BUY":
+                total_placed += 1
+                buy_queue.setdefault(ticker, []).append((qty, price))
+
+            elif action == "SELL":
+                total_placed += 1
+                buys      = buy_queue.get(ticker, [])
+                remaining = qty
+                cost      = 0.0
+                used      = 0.0
+                while buys and remaining > 0:
+                    bqty, bprice = buys[0]
+                    take      = min(bqty, remaining)
+                    cost     += take * bprice
+                    used     += take
+                    remaining -= take
+                    if take == bqty:
+                        buys.pop(0)
+                    else:
+                        buys[0] = (bqty - take, bprice)
+                if used > 0:
+                    closed.append((ticker, used * price - cost))
+
+        # ── Build response ────────────────────────────────────────────
+        lines = [
+            "📊 <b>Bot Performance Stats:</b>",
+            f"Total trades:     {total_placed}",
+        ]
+
+        if not closed:
+            lines += [
+                "",
+                "No closed trades yet.",
+                "(Win rate &amp; P&amp;L stats appear when positions are closed)",
+            ]
+            self._reply("\n".join(lines))
+            return
+
+        wins   = [(t, p) for t, p in closed if p > 0]
+        losses = [(t, p) for t, p in closed if p <= 0]
+
+        win_rate = len(wins) / len(closed) * 100
+        avg_win  = sum(p for _, p in wins)   / len(wins)   if wins   else 0.0
+        avg_loss = sum(p for _, p in losses) / len(losses) if losses else 0.0
+        rr_ratio = abs(avg_win / avg_loss)                  if avg_loss else None
+
+        best  = max(closed, key=lambda x: x[1])
+        worst = min(closed, key=lambda x: x[1])
+
+        # Streak — walk backward from the most recent closed trade
+        streak_wins = streak_losses = 0
+        if closed[-1][1] > 0:
+            for _, p in reversed(closed):
+                if p > 0:
+                    streak_wins += 1
+                else:
+                    break
+        else:
+            for _, p in reversed(closed):
+                if p <= 0:
+                    streak_losses += 1
+                else:
+                    break
+        streak_str = (
+            f"{streak_wins} wins" if streak_wins > 0 else f"{streak_losses} losses"
+        )
+
+        rr_str = f"{rr_ratio:.1f}x" if rr_ratio is not None else "N/A (no losses yet)"
+
+        lines += [
+            f"Win rate:         {win_rate:.0f}% (target: &gt;50%)",
+            f"Avg win:          $+{avg_win:,.2f}",
+            f"Avg loss:         $-{abs(avg_loss):,.2f}",
+            f"Risk/reward:      {rr_str}",
+            f"Best trade:       $+{best[1]:,.2f} ({best[0]})",
+            f"Worst trade:      ${_sign(worst[1])}{worst[1]:,.2f} ({worst[0]})",
+            f"Current streak:   {streak_str}",
+        ]
+
+        # Sharpe ratio — meaningful only with >= 10 closed trades
+        if len(closed) >= 10:
+            import statistics
+            pnl_vals = [p for _, p in closed]
+            std = statistics.stdev(pnl_vals)
+            if std > 0:
+                sharpe = statistics.mean(pnl_vals) / std * (len(pnl_vals) ** 0.5)
+                lines.append(f"Sharpe ratio:     {sharpe:.2f}")
 
         self._reply("\n".join(lines))
 
