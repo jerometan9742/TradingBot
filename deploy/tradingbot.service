@@ -1,0 +1,53 @@
+# AI Trading Bot — Scheduler (analysis + order execution)
+#
+# Runs scheduler.py, which fires analysis cycles at:
+#   08:50 SGT  reset daily counters
+#   09:00 SGT  SGX market-open analysis
+#   15:00 SGT  SGX pre-close analysis
+#   21:30 SGT  NYSE market-open analysis (US tickers only)
+#
+# SETUP (one-time, on the VPS):
+#   1. Update WorkingDirectory and ExecStart paths if your project is not at /opt/ai-trading-bot
+#   2. Update User to match the OS user that owns the project directory
+#   3. sudo cp deploy/tradingbot.service /etc/systemd/system/
+#   4. sudo systemctl daemon-reload
+#   5. sudo systemctl enable tradingbot
+#   6. sudo systemctl start tradingbot
+#
+# OPERATIONS:
+#   sudo systemctl status tradingbot
+#   sudo journalctl -u tradingbot -f             # live logs
+#   sudo systemctl restart tradingbot
+#   sudo systemctl stop tradingbot
+
+[Unit]
+Description=AI Trading Bot — Scheduler (analysis + order execution)
+Documentation=https://github.com/jerometan9742/TradingBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+WorkingDirectory=/opt/ai-trading-bot
+ExecStart=/opt/ai-trading-bot/venv/bin/python scheduler.py
+
+# Restart on crash; give it 30s before retrying (allow FutuOpenD to recover)
+Restart=always
+RestartSec=30
+
+# Log to journald (view with: journalctl -u tradingbot)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingbot
+
+# Load .env automatically via EnvironmentFile
+EnvironmentFile=/opt/ai-trading-bot/.env
+
+# Resource limits — scheduler is memory-light between cycles
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
