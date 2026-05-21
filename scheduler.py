@@ -2,6 +2,7 @@
 scheduler.py — APScheduler-driven pipeline runner for the AI trading bot.
 
 Schedule (SGT / Asia/Singapore — all Mon-Fri):
+    18:00  universe_update_cycle()           — auto-refresh watchlist_universe.txt
     19:00  reset_daily_state()               — clear counters before session
     19:00  run_daily_screen()                — momentum screener, top-15 → Telegram
     20:00  run_analysis_cycle("pre_market")  — pre-market scan, min confidence 8.5
@@ -121,6 +122,15 @@ class TradingScheduler:
         self._apscheduler = BlockingScheduler(timezone=_TZ_SCHED)
 
         self._apscheduler.add_job(
+            func=self.universe_update_cycle,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=18, minute=0,
+                                timezone=_TZ_SCHED),
+            id="universe_update",
+            name="Universe auto-refresh (18:00 SGT)",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        self._apscheduler.add_job(
             func=self.reset_daily_state,
             trigger=CronTrigger(day_of_week="mon-fri", hour=19, minute=0,
                                 timezone=_TZ_SCHED),
@@ -196,6 +206,7 @@ class TradingScheduler:
             from monitoring.telegram_listener import TelegramCommandListener
             listener = TelegramCommandListener(
                 screen_callback=self.run_daily_screen,
+                universe_callback=self.universe_update_cycle,
             )
             listener.listen_in_background()
         except Exception as exc:
@@ -294,6 +305,28 @@ class TradingScheduler:
             label, approved_count[0], blocked_count[0],
         )
         logger.info("=" * 60)
+
+    def universe_update_cycle(self) -> None:
+        """
+        18:00 SGT — rebuild watchlist_universe.txt from live market data.
+        Sends a Telegram diff notification when done.
+        Also triggered by /universe refresh Telegram command.
+        """
+        from data.universe_builder import UniverseBuilder
+        from monitoring.telegram_alerts import send_universe_updated
+
+        logger.info("[TradingScheduler] Universe update starting")
+        try:
+            result = UniverseBuilder().build()
+            send_universe_updated(result)
+            logger.info(
+                "[TradingScheduler] Universe updated — %d tickers  added=%d  removed=%d",
+                result["total"], len(result["added"]), len(result["removed"]),
+            )
+        except Exception as exc:
+            logger.error(
+                "[TradingScheduler] Universe update failed: %s", exc, exc_info=True
+            )
 
     def run_daily_screen(self) -> None:
         """

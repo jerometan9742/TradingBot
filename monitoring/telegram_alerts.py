@@ -307,6 +307,46 @@ class TelegramAlerter:
         )
         return self._send(text)
 
+    def send_universe_updated(self, result: dict) -> bool:
+        """
+        Alert: universe auto-update complete.
+
+        Args:
+            result: dict returned by UniverseBuilder.build() with keys
+                    total, added, removed, core, sources.
+        """
+        total   = result.get("total", 0)
+        added   = result.get("added", [])
+        removed = result.get("removed", [])
+        core    = result.get("core", [])
+        src     = result.get("sources", {})
+
+        lines = [
+            f"🌐 <b>Universe updated: {total} tickers loaded</b>",
+            f"Source A (movers): {src.get('source_a', 0)}  "
+            f"Source B (quality): {src.get('source_b', 0)}",
+            "",
+        ]
+
+        if added:
+            lines.append(f"New additions: {', '.join(added[:20])}"
+                         + (" …" if len(added) > 20 else ""))
+        else:
+            lines.append("No new additions")
+
+        if removed:
+            lines.append(f"Removed: {', '.join(removed[:20])}"
+                         + (" …" if len(removed) > 20 else ""))
+        else:
+            lines.append("No removals")
+
+        lines.extend([
+            "",
+            f"Core tickers protected: {', '.join(core)}",
+            f"\nTime: {_now_sgt()}",
+        ])
+        return self._send("\n".join(lines))
+
     def send_screener_results(self, results: list) -> bool:
         """
         Alert: daily momentum screener top-15 candidates.
@@ -493,6 +533,10 @@ def send_market_close_summary(portfolio_state: dict, positions: list) -> bool:
 
 def send_screener_results(results: list) -> bool:
     return _alerter().send_screener_results(results)
+
+
+def send_universe_updated(result: dict) -> bool:
+    return _alerter().send_universe_updated(result)
 
 
 # ---------------------------------------------------------------------------
