@@ -34,12 +34,23 @@ def log_decision(ticker: str, decision: dict, market_data: dict) -> str:
     return str(filename)
 
 
-def log_trade(ticker: str, action: str, quantity: float, price: float, order_id: str) -> None:
+def log_trade(
+    ticker: str,
+    action: str,
+    quantity: float,
+    price: float,
+    order_id: str,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0,
+) -> None:
     """Log a placed trade to a running CSV."""
     trade_log = LOG_DIR / "trades.csv"
     write_header = not trade_log.exists()
 
     with open(trade_log, "a") as f:
         if write_header:
-            f.write("timestamp,ticker,action,quantity,price,order_id\n")
-        f.write(f"{datetime.utcnow().isoformat()},{ticker},{action},{quantity},{price},{order_id}\n")
+            f.write("timestamp,ticker,action,quantity,price,order_id,stop_loss,take_profit\n")
+        f.write(
+            f"{datetime.utcnow().isoformat()},{ticker},{action},{quantity},{price},"
+            f"{order_id},{stop_loss},{take_profit}\n"
+        )

@@ -89,6 +89,7 @@ class PositionSizer:
         entry_price: float,
         portfolio_value: float,
         confidence: float,
+        market_data: dict | None = None,
     ) -> dict:
         """
         Calculate a position size for a proposed trade.
@@ -99,6 +100,8 @@ class PositionSizer:
             entry_price:     Current market price per share
             portfolio_value: Fallback equity if live MooMoo fetch fails
             confidence:      Agent confidence score, 7.0 – 10.0
+            market_data:     Optional unified data dict from DataFetcher;
+                             used to extract ATR for dynamic SL/TP levels.
 
         Returns:
             Sizing dict (see module docstring for full schema).
@@ -173,9 +176,23 @@ class PositionSizer:
                 f"minimum trade size ${MIN_TRADE_VALUE:.2f}"
             )
 
-        # --- stop-loss and take-profit -----------------------------------
+        # --- stop-loss and take-profit (ATR-based when available) --------
+        atr_value = None
+        if market_data:
+            atr_value = (market_data.get("technicals") or {}).get("atr_14")
+            if atr_value:
+                logger.info(
+                    "[PositionSizer] ATR-14 for %s: %.4f — using dynamic SL/TP",
+                    ticker, atr_value,
+                )
+            else:
+                logger.info(
+                    "[PositionSizer] ATR not available for %s — using fixed-pct SL/TP",
+                    ticker,
+                )
+
         stop_loss_price, take_profit_price = self._levels(
-            action, entry_price
+            action, entry_price, atr_value=atr_value
         )
 
         result = {
@@ -187,6 +204,9 @@ class PositionSizer:
             "position_pct":       round(position_value / portfolio_value, 6),
             "stop_loss_price":    round(stop_loss_price, 4),
             "take_profit_price":  round(take_profit_price, 4),
+            "stop_loss_pct":      round(abs(entry_price - stop_loss_price) / entry_price, 6),
+            "take_profit_pct":    round(abs(take_profit_price - entry_price) / entry_price, 6),
+            "atr_14":             round(atr_value, 4) if atr_value else None,
             "risk_amount":        round(risk_amount, 2),
             "max_position_value": round(max_position_value, 2),
         }
@@ -230,10 +250,23 @@ class PositionSizer:
             logger.warning("[PositionSizer] MooMoo equity fetch failed: %s", exc)
             return None
 
-    def _levels(self, action: str, entry_price: float):
-        """Return (stop_loss_price, take_profit_price) for BUY or SELL."""
-        stop_distance = entry_price * self.stop_loss_pct
-        tp_distance   = stop_distance * self.take_profit_multiplier
+    def _levels(
+        self,
+        action: str,
+        entry_price: float,
+        atr_value: Optional[float] = None,
+    ):
+        """Return (stop_loss_price, take_profit_price) for BUY or SELL.
+
+        ATR-based when atr_value is provided (SL = 1.5×ATR, TP = 3.0×ATR).
+        Falls back to fixed percentages from .env otherwise.
+        """
+        if atr_value and atr_value > 0:
+            stop_distance = atr_value * 1.5
+            tp_distance   = atr_value * 3.0
+        else:
+            stop_distance = entry_price * self.stop_loss_pct
+            tp_distance   = stop_distance * self.take_profit_multiplier
 
         if action == "BUY":
             stop_loss_price   = entry_price - stop_distance

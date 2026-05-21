@@ -127,3 +127,12 @@ class AlphaVantageClient:
             "time_period": period,
             "series_type": "close",
         })
+
+    def get_atr(self, ticker: str, interval: str = "daily", period: int = 14) -> dict:
+        """Average True Range."""
+        return self._get({
+            "function": "ATR",
+            "symbol": ticker,
+            "interval": interval,
+            "time_period": period,
+        })

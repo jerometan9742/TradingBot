@@ -408,6 +408,7 @@ class TradingScheduler:
                 entry_price=entry_price,
                 portfolio_value=portfolio_value,
                 confidence=decision["confidence"],
+                market_data=data,
             )
         except PositionSizerError as exc:
             logger.warning("[%s] PositionSizer rejected: %s", ticker, exc)
@@ -448,6 +449,48 @@ class TradingScheduler:
         logger.info("[%s] Order placed — id=%s  status=%s",
                     ticker, oid, order.get("status"))
 
+        # 5b. Bracket orders for BUY (SL + TP limit sells)
+        if decision["action"] == "BUY":
+            sl_price = sizing["stop_loss_price"]
+            tp_price = sizing["take_profit_price"]
+            qty      = sizing["quantity"]
+
+            try:
+                sl_order = executor.place_order(
+                    ticker=ticker,
+                    action="SELL",
+                    quantity=qty,
+                    order_type="limit",
+                    price=sl_price,
+                )
+                if sl_order:
+                    logger.info(
+                        "[%s] SL order placed — id=%s @ $%.2f",
+                        ticker, sl_order.get("order_id", ""), sl_price,
+                    )
+                else:
+                    logger.warning("[%s] SL order submission failed", ticker)
+            except Exception as exc:
+                logger.warning("[%s] SL order error: %s", ticker, exc)
+
+            try:
+                tp_order = executor.place_order(
+                    ticker=ticker,
+                    action="SELL",
+                    quantity=qty,
+                    order_type="limit",
+                    price=tp_price,
+                )
+                if tp_order:
+                    logger.info(
+                        "[%s] TP order placed — id=%s @ $%.2f",
+                        ticker, tp_order.get("order_id", ""), tp_price,
+                    )
+                else:
+                    logger.warning("[%s] TP order submission failed", ticker)
+            except Exception as exc:
+                logger.warning("[%s] TP order error: %s", ticker, exc)
+
         # 6. Log trade
         try:
             log_trade(
@@ -456,6 +499,8 @@ class TradingScheduler:
                 quantity=sizing["quantity"],
                 price=entry_price,
                 order_id=oid,
+                stop_loss=sizing["stop_loss_price"],
+                take_profit=sizing["take_profit_price"],
             )
         except Exception as exc:
             logger.warning("[%s] log_trade failed: %s", ticker, exc)

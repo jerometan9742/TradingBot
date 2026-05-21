@@ -187,26 +187,30 @@ class DataFetcher:
 
     def _fetch_technicals(self, ticker: str) -> dict:
         try:
-            rsi_data = self.av.get_rsi(ticker)
+            rsi_data  = self.av.get_rsi(ticker)
             macd_data = self.av.get_macd(ticker)
-            bb_data = self.av.get_bollinger_bands(ticker)
+            bb_data   = self.av.get_bollinger_bands(ticker)
+            atr_data  = self.av.get_atr(ticker)
 
-            rsi_series = rsi_data.get("Technical Analysis: RSI", {})
+            rsi_series  = rsi_data.get("Technical Analysis: RSI", {})
             macd_series = macd_data.get("Technical Analysis: MACD", {})
-            bb_series = bb_data.get("Technical Analysis: BBANDS", {})
+            bb_series   = bb_data.get("Technical Analysis: BBANDS", {})
+            atr_series  = atr_data.get("Technical Analysis: ATR", {})
 
-            latest_rsi_date = next(iter(rsi_series), None)
+            latest_rsi_date  = next(iter(rsi_series), None)
             latest_macd_date = next(iter(macd_series), None)
-            latest_bb_date = next(iter(bb_series), None)
+            latest_bb_date   = next(iter(bb_series), None)
+            latest_atr_date  = next(iter(atr_series), None)
 
             return {
-                "rsi_14": float(rsi_series[latest_rsi_date]["RSI"]) if latest_rsi_date else None,
-                "macd": float(macd_series[latest_macd_date]["MACD"]) if latest_macd_date else None,
-                "macd_signal": float(macd_series[latest_macd_date]["MACD_Signal"]) if latest_macd_date else None,
-                "macd_hist": float(macd_series[latest_macd_date]["MACD_Hist"]) if latest_macd_date else None,
-                "bb_upper": float(bb_series[latest_bb_date]["Real Upper Band"]) if latest_bb_date else None,
-                "bb_middle": float(bb_series[latest_bb_date]["Real Middle Band"]) if latest_bb_date else None,
-                "bb_lower": float(bb_series[latest_bb_date]["Real Lower Band"]) if latest_bb_date else None,
+                "rsi_14":     float(rsi_series[latest_rsi_date]["RSI"])               if latest_rsi_date  else None,
+                "macd":       float(macd_series[latest_macd_date]["MACD"])            if latest_macd_date else None,
+                "macd_signal":float(macd_series[latest_macd_date]["MACD_Signal"])     if latest_macd_date else None,
+                "macd_hist":  float(macd_series[latest_macd_date]["MACD_Hist"])       if latest_macd_date else None,
+                "bb_upper":   float(bb_series[latest_bb_date]["Real Upper Band"])     if latest_bb_date   else None,
+                "bb_middle":  float(bb_series[latest_bb_date]["Real Middle Band"])    if latest_bb_date   else None,
+                "bb_lower":   float(bb_series[latest_bb_date]["Real Lower Band"])     if latest_bb_date   else None,
+                "atr_14":     float(atr_series[latest_atr_date]["ATR"])               if latest_atr_date  else None,
             }
         except Exception as e:
             logger.error("[DataFetcher] Technicals error (%s): %s", ticker, e)

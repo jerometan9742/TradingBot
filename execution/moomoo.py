@@ -163,6 +163,7 @@ class MooMooConnector:
         action: str,
         quantity: int,
         order_type: str = "market",
+        price: float = 0.0,
     ) -> Optional[dict]:
         """
         Submit an order via FutuOpenD.
@@ -172,6 +173,7 @@ class MooMooConnector:
             action:     "buy" or "sell" (case-insensitive)
             quantity:   Whole shares (must be >= 1)
             order_type: "market" (default) or "limit"
+            price:      Limit price; ignored for market orders (use 0.0)
 
         Returns:
             { order_id, ticker, code, action, quantity, order_type, status }
@@ -206,7 +208,7 @@ class MooMooConnector:
         try:
             ctx = self._ctx_for_ticker(ticker)
             ret, data = ctx.place_order(
-                price=0.0,   # market orders use price=0
+                price=price,
                 qty=float(quantity),
                 code=code,
                 trd_side=side,
