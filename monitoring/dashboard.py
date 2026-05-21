@@ -160,12 +160,14 @@ def _get_account() -> Optional[dict]:
         return None
     try:
         if hasattr(ex, "get_account_balance"):
-            bal = ex.get_account_balance()
-            pv  = bal.get("portfolio_value", 0.0)
+            bal    = ex.get_account_balance()
+            us     = bal.get("by_market", {}).get("US", {})
+            pv     = us.get("total_assets", 0.0)
+            cash   = us.get("cash", 0.0)
             return {
                 "equity":         pv,
-                "cash":           bal.get("cash", 0.0),
-                "buying_power":   bal.get("cash", 0.0),
+                "cash":           cash,
+                "buying_power":   cash,
                 "daily_pnl":      0.0,
                 "unrealised_pnl": bal.get("market_value", 0.0),
             }
