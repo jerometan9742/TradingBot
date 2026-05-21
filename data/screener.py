@@ -262,3 +262,50 @@ def _score_ema(dist_pct: float) -> float:
     if dist_pct < 20:
         return 8.0 - (dist_pct - 10) / 10.0 * 4.0   # 8 → 4
     return max(1.0, 4.0 - (dist_pct - 20) / 10.0 * 3.0)
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+def _print_results(results: list) -> None:
+    if not results:
+        print("No results — check data download or universe file.")
+        return
+    print(f"\n{'🔍 Daily Screen — Top ' + str(len(results)) + ' Candidates':}")
+    print("Sorted by momentum score:\n")
+    for i, r in enumerate(results, 1):
+        arrow = "▲" if r["change_5d"] >= 0 else "▼"
+        print(
+            f"{i:>2}. {r['ticker']:<6} {arrow} {r['score']:.1f}/10  "
+            f"RSI:{r['rsi_14']:.0f}  Vol:{r['volume_ratio']:.1f}x avg  "
+            f"5d:{r['change_5d']:+.1f}%  EMA50:{r['ema50_dist_pct']:+.1f}%  "
+            f"${r['price']:.2f}"
+        )
+    print()
+
+
+if __name__ == "__main__":
+    import argparse
+    import logging as _logging
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    parser = argparse.ArgumentParser(description="Daily momentum screener")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one screen cycle and print results",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=15,
+        help="Number of top tickers to show (default: 15)",
+    )
+    args = parser.parse_args()
+
+    results = MomentumScreener().screen(top_n=args.top)
+    _print_results(results)
