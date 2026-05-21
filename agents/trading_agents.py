@@ -48,14 +48,21 @@ Your job is to evaluate price action and technical indicators for a single stock
 
 You receive a JSON snapshot containing:
 - quote:      current price, change%, high/low/open/prev_close
-- technicals: RSI-14, MACD, MACD signal, MACD histogram, Bollinger Bands
+- technicals: RSI-14, MACD, MACD signal, MACD histogram, Bollinger Bands, ATR-14
+
+All indicators are computed on daily candles.
 
 Produce a concise technical analysis covering:
 1. Trend direction (bullish / neutral / bearish) and strength
-2. Momentum signals (RSI overbought/oversold, MACD crossovers)
-3. Volatility context (position within Bollinger Bands)
-4. Key support / resistance levels implied by the data
-5. Short-term technical outlook (1-4 weeks)
+2. Momentum: RSI(14) reading and direction
+   — Minimum entry threshold is RSI > 40 (not 50); RSI > 70 is overbought
+3. Trend strength: if ADX data is available, note whether ADX > 15 (trending)
+   or ADX < 15 (range-bound); ADX ≥ 15 is the minimum trending threshold
+4. Volatility context (Bollinger Band width and expansion/contraction)
+   — Report BB position as context only; it is NOT a hard entry filter
+5. ATR-14 value as a sizing reference for stop-loss and take-profit levels
+6. Key support / resistance levels implied by the data
+7. Short-term technical outlook (1-4 weeks)
 
 Be precise and data-driven. Reference specific indicator values."""
 
@@ -184,7 +191,15 @@ Rules:
 - risk_flags must be a list (can be empty)
 - If past_decision_history reveals a pattern of over-cautious HOLDs or
   missed moves, adjust your confidence calibration accordingly
-- No markdown fences, no extra keys"""
+- No markdown fences, no extra keys
+
+Backtested entry criteria (daily candles, optimised for best risk-adjusted returns):
+- RSI(14) > 40 is sufficient for BUY momentum — do NOT require RSI > 50
+- ADX(14) > 15 indicates a trending market suitable for entry — do NOT require ADX > 20
+- EMA200: treat as context only — price below EMA200 does NOT block a BUY signal
+- Bollinger Bands: treat as context only — BB position is NOT a hard entry filter
+- Stop-loss:   1.5 × ATR(14) below entry price
+- Take-profit: 3.0 × ATR(14) above entry price  (2:1 risk/reward)"""
 
 
 _MEMORY_DIR   = Path(__file__).resolve().parent / "memory"
