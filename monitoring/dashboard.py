@@ -344,26 +344,23 @@ def page_live_overview():
         daily_pnl = account.get("daily_pnl", 0.0)
         daily_pct = (daily_pnl / equity * 100) if equity else 0.0
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Equity",    f"${equity:,.2f}")
-        c2.metric("Cash",            f"${account.get('cash', 0):,.2f}")
-        c3.metric("Buying Power",    f"${account.get('buying_power', 0):,.2f}")
-        c4.metric("Daily P&L",
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Equity",   f"${equity:,.2f}")
+        c2.metric("Cash",           f"${account.get('cash', 0):,.2f}")
+        c3.metric("Daily P&L",
                   f"${daily_pnl:+,.2f}",
                   delta=f"{daily_pct:+.2f}%",
                   delta_color="normal")
-        c5.metric("Unrealised P&L",  f"${unrealised_pnl:+,.2f}")
+        c4.metric("Unrealised P&L", f"${unrealised_pnl:+,.2f}")
     else:
         st.info(
             "Alpaca not configured — set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` "
             "in `.env` to see live account data."
         )
-        for label in ["Total Equity", "Cash", "Buying Power", "Daily P&L", "Unrealised P&L"]:
-            pass  # metrics rendered below
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         for col, lbl in zip(
-            [c1, c2, c3, c4, c5],
-            ["Total Equity", "Cash", "Buying Power", "Daily P&L", "Unrealised P&L"],
+            [c1, c2, c3, c4],
+            ["Total Equity", "Cash", "Daily P&L", "Unrealised P&L"],
         ):
             col.metric(lbl, "—")
 
