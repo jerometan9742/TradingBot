@@ -256,36 +256,59 @@ class TradingScheduler:
 
     def _make_executor(self):
         """
-        Construct an AlpacaExecutor.  Returns None if keys are placeholder
-        values — callers treat None as 'no broker available'.
+        Construct the configured broker connector.
+        BROKER env var selects 'moomoo' (default) or 'alpaca'.
+        Returns None if the broker cannot be initialised — callers treat
+        None as 'no broker available' and log trades without placing orders.
         """
-        api_key    = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        if api_key in ("", "your-key-here") or secret_key in ("", "your-key-here"):
-            logger.warning(
-                "[TradingScheduler] Alpaca keys not configured — "
-                "order execution disabled"
-            )
-            return None
-        try:
-            from execution.alpaca import AlpacaExecutor
-            return AlpacaExecutor()
-        except Exception as exc:
-            logger.error("[TradingScheduler] AlpacaExecutor init failed: %s", exc)
-            return None
+        broker = os.getenv("BROKER", "moomoo").lower()
+
+        if broker == "moomoo":
+            try:
+                from execution.moomoo import MooMooConnector
+                return MooMooConnector()
+            except Exception as exc:
+                logger.error("[TradingScheduler] MooMooConnector init failed: %s", exc)
+                return None
+        else:
+            api_key    = os.getenv("ALPACA_API_KEY", "")
+            secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+            if api_key in ("", "your-key-here") or secret_key in ("", "your-key-here"):
+                logger.warning(
+                    "[TradingScheduler] Alpaca keys not configured — "
+                    "order execution disabled"
+                )
+                return None
+            try:
+                from execution.alpaca import AlpacaExecutor
+                return AlpacaExecutor()
+            except Exception as exc:
+                logger.error("[TradingScheduler] AlpacaExecutor init failed: %s", exc)
+                return None
 
     def _refresh_portfolio(self, executor) -> None:
-        """Pull live equity / buying_power / positions from Alpaca into state."""
+        """Pull live account state and positions from the active broker."""
         if executor is None:
             return
         try:
-            account = executor.get_account()
-            if account:
-                with self._state_lock:
-                    self._portfolio_state["equity"]          = account["equity"]
-                    self._portfolio_state["buying_power"]    = account["buying_power"]
-                    self._portfolio_state["portfolio_value"] = account["portfolio_value"]
-                    self._portfolio_state["daily_pnl"]       = account["daily_pnl"]
+            # MooMooConnector exposes get_account_balance(); AlpacaExecutor uses get_account()
+            if hasattr(executor, "get_account_balance"):
+                bal = executor.get_account_balance()
+                if bal:
+                    pv = bal.get("portfolio_value", 0.0)
+                    with self._state_lock:
+                        self._portfolio_state["equity"]          = pv
+                        self._portfolio_state["buying_power"]    = bal.get("cash", 0.0)
+                        self._portfolio_state["portfolio_value"] = pv
+                        # MooMoo balance API doesn't return daily P&L; keep existing value
+            else:
+                account = executor.get_account()
+                if account:
+                    with self._state_lock:
+                        self._portfolio_state["equity"]          = account["equity"]
+                        self._portfolio_state["buying_power"]    = account["buying_power"]
+                        self._portfolio_state["portfolio_value"] = account["portfolio_value"]
+                        self._portfolio_state["daily_pnl"]       = account["daily_pnl"]
 
             with self._state_lock:
                 self._portfolio_state["open_positions"] = executor.get_positions()
@@ -421,8 +444,9 @@ class TradingScheduler:
             return
 
         approved_count[0] += 1
+        oid = order.get("order_id") or order.get("id", "")
         logger.info("[%s] Order placed — id=%s  status=%s",
-                    ticker, order.get("id"), order.get("status"))
+                    ticker, oid, order.get("status"))
 
         # 6. Log trade
         try:
@@ -431,7 +455,7 @@ class TradingScheduler:
                 action=decision["action"],
                 quantity=sizing["quantity"],
                 price=entry_price,
-                order_id=order.get("id", ""),
+                order_id=oid,
             )
         except Exception as exc:
             logger.warning("[%s] log_trade failed: %s", ticker, exc)
