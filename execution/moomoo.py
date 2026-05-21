@@ -342,6 +342,76 @@ class MooMooConnector:
         logger.error("[MooMoo] cancel_order: order %s not found on any market", order_id)
         return False
 
+    def _futu_code_to_ticker(self, code: str) -> str:
+        """
+        Reverse-convert a Futu code to a displayable ticker symbol.
+            US.AAPL  → AAPL
+            HK.D05   → D05.SI   (alpha base → SGX)
+            HK.00700 → 0700.HK  (numeric base → HK stock)
+        """
+        if code.startswith("US."):
+            return code[3:]
+        if code.startswith("HK."):
+            base = code[3:].lstrip("0") or "0"
+            return (base + ".HK") if base.isdigit() else (base + ".SI")
+        return code
+
+    def get_open_orders(self) -> list:
+        """
+        Fetch all open (pending / partially-filled) orders across HK and US markets.
+
+        Returns:
+            List of {
+                order_id, ticker, action, quantity, filled_qty,
+                order_type, price, status, market
+            }.
+            Empty list on failure.
+        """
+        _OPEN_KEYWORDS = ("SUBMITTED", "FILLED_PART", "WAITING", "SUBMITTING")
+        ft = self._ft
+        orders: list = []
+
+        for market in ("HK", "US"):
+            try:
+                ctx = self._get_ctx(market)
+                ret, data = ctx.order_list_query(trd_env=self._trd_env)
+                if ret != ft.RET_OK:
+                    logger.warning(
+                        "[MooMoo] order_list_query failed (%s): %s", market, data
+                    )
+                    continue
+
+                if hasattr(data, "iterrows"):
+                    for _, row in data.iterrows():
+                        status = str(row.get("order_status", ""))
+                        if not any(kw in status.upper() for kw in _OPEN_KEYWORDS):
+                            continue
+                        code = str(row.get("code", ""))
+                        orders.append({
+                            "order_id":   str(row.get("order_id", "")),
+                            "ticker":     self._futu_code_to_ticker(code),
+                            "code":       code,
+                            "action":     str(row.get("trd_side", "")).upper(),
+                            "quantity":   int(float(row.get("qty", 0) or 0)),
+                            "filled_qty": int(float(row.get("dealt_qty", 0) or 0)),
+                            "order_type": str(row.get("order_type", "")),
+                            "price":      float(row.get("price", 0) or 0),
+                            "status":     status,
+                            "market":     market,
+                        })
+
+            except MooMooConnectorError as exc:
+                logger.warning(
+                    "[MooMoo] %s context unavailable for open orders: %s", market, exc
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MooMoo] get_open_orders error (%s): %s", market, exc, exc_info=True
+                )
+
+        logger.info("[MooMoo] %d open order(s)", len(orders))
+        return orders
+
     # ── Account queries ───────────────────────────────────────────────────────
 
     def get_account_balance(self) -> dict:
@@ -422,14 +492,17 @@ class MooMooConnector:
                 if hasattr(data, "iterrows"):
                     for _, row in data.iterrows():
                         pl_ratio = float(row.get("pl_ratio", 0) or 0)
+                        code = str(row.get("code", ""))
                         positions.append({
-                            "ticker":             str(row.get("code", "")),
-                            "code":               str(row.get("code", "")),
+                            "ticker":             code,
+                            "display_ticker":     self._futu_code_to_ticker(code),
+                            "code":               code,
                             "quantity":           int(float(row.get("qty", 0) or 0)),
                             "entry_price":        float(row.get("cost_price", 0) or 0),
                             "current_price":      float(row.get("last_price", 0) or 0),
                             "unrealised_pnl":     float(row.get("pl_val", 0) or 0),
                             "unrealised_pnl_pct": pl_ratio * 100,
+                            "today_pnl":          float(row.get("today_pl_val", 0) or 0),
                             "market":             market,
                         })
 
