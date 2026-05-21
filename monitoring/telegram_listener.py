@@ -3,18 +3,41 @@ TelegramCommandListener — long-polls Telegram getUpdates and handles all
 bot commands including multi-step trade flows.
 
 ──────────────────────────────
-INFO COMMANDS (single response)
+INFO COMMANDS
 ──────────────────────────────
+/help               — all commands grouped by category
 /watchlist          — active watchlist.txt contents
 /universe [...]     — universe pool commands (list/add/remove/refresh)
+/signals            — latest confidence scores for watchlist tickers
+/news TICKER        — latest 5 news headlines + sentiment (Finnhub)
+/chart TICKER       — technical summary (price, RSI, EMA, MACD)
+/summary            — full account snapshot
+/history            — last 10 closed trades from logs/trades.csv
+/status             — VPS service status check
 /orders             — open orders via MooMoo
 /positions          — open positions with P&L
 /pnl                — today + unrealised P&L summary
 /cash               — available cash balance
 
+──────────────────────────────
+SCREENING COMMANDS
+──────────────────────────────
+/screen             — run momentum screener now
+/screenstock TICKER — full 7-agent TradingAgents pipeline on one ticker
+
+──────────────────────────────
+WATCHLIST COMMANDS
+──────────────────────────────
 /add TICKER …       — add to watchlist.txt
 /remove TICKER …    — remove from watchlist.txt
-/screen             — run momentum screener now
+
+──────────────────────────────
+BOT CONTROL COMMANDS
+──────────────────────────────
+/pause              — pause trading without full kill switch (pause.lock)
+/resume             — delete pause.lock, re-enable trading
+/killswitch on      — write kill_switch.lock, halt all trading
+/killswitch off     — delete kill_switch.lock, resume trading
 
 ──────────────────────────────
 TRADE COMMANDS (multi-step, 60 s timeout)
@@ -24,15 +47,20 @@ TRADE COMMANDS (multi-step, 60 s timeout)
 /cancel             — list open orders → pick one → cancel it
 
 Security: only TELEGRAM_CHAT_ID is authorised.
-Kill switch: all trade commands abort if kill_switch.lock exists.
+Kill switch + pause: all trade commands abort if kill_switch.lock or pause.lock exists.
 """
 
+import csv
+import json
 import logging
 import os
+import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -44,15 +72,22 @@ logger = logging.getLogger(__name__)
 _WATCHLIST_PATH  = Path(__file__).resolve().parent.parent / "watchlist.txt"
 _UNIVERSE_PATH   = Path(__file__).resolve().parent.parent / "watchlist_universe.txt"
 _KILL_SWITCH     = Path(__file__).resolve().parent.parent / "kill_switch.lock"
+_PAUSE_LOCK      = Path(__file__).resolve().parent.parent / "pause.lock"
+_LOG_DIR         = Path(__file__).resolve().parent.parent / "logs"
+_TRADES_CSV      = _LOG_DIR / "trades.csv"
 _POLL_TIMEOUT    = 30    # long-poll window (seconds)
 _REQUEST_TIMEOUT = 35    # requests timeout > _POLL_TIMEOUT
 _RETRY_WAIT      = 10    # back-off after poll error
 _CONV_TIMEOUT    = 60    # conversation step timeout (seconds)
 _ATR_SL_MULT     = 1.5   # SL = price − ATR × 1.5
 _ATR_TP_MULT     = 3.0   # TP = price + ATR × 3.0
+_SGT             = ZoneInfo("Asia/Singapore")
+
+# Scheduled run times (SGT hour, minute) Mon-Fri — used by /summary and /status
+_SCHEDULE_TIMES = [(19, 0), (20, 0), (21, 30), (3, 0), (4, 0)]
 
 
-# ── Display helper ────────────────────────────────────────────────────────────
+# ── Display helpers ────────────────────────────────────────────────────────────
 
 def _display_ticker(futu_code: str) -> str:
     """US.AAPL → AAPL, HK.D05 → D05.SI, HK.00700 → 0700.HK"""
@@ -177,25 +212,31 @@ class TelegramCommandListener:
             args  = parts[1:]
             logger.info("[TelegramListener] cmd=%s  args=%s  chat=%s", cmd, args, chat_id)
 
-            if   cmd == "/add":       self._cmd_add(args)
-            elif cmd == "/remove":    self._cmd_remove(args)
-            elif cmd == "/watchlist": self._cmd_watchlist()
-            elif cmd == "/universe":  self._cmd_universe(args)
-            elif cmd == "/screen":    self._cmd_screen()
-            elif cmd == "/orders":    self._cmd_orders()
-            elif cmd == "/positions": self._cmd_positions()
-            elif cmd == "/pnl":       self._cmd_pnl()
-            elif cmd == "/cash":      self._cmd_cash()
-            elif cmd == "/buy":       self._cmd_buy(chat_id, args)
-            elif cmd == "/sell":      self._cmd_sell(chat_id, args)
-            elif cmd == "/cancel":    self._cmd_cancel(chat_id)
+            if   cmd == "/help":        self._cmd_help()
+            elif cmd == "/watchlist":   self._cmd_watchlist()
+            elif cmd == "/universe":    self._cmd_universe(args)
+            elif cmd == "/signals":     self._cmd_signals()
+            elif cmd == "/news":        self._cmd_news(args)
+            elif cmd == "/chart":       self._cmd_chart(args)
+            elif cmd == "/summary":     self._cmd_summary()
+            elif cmd == "/history":     self._cmd_history()
+            elif cmd == "/status":      self._cmd_status()
+            elif cmd == "/orders":      self._cmd_orders()
+            elif cmd == "/positions":   self._cmd_positions()
+            elif cmd == "/pnl":         self._cmd_pnl()
+            elif cmd == "/cash":        self._cmd_cash()
+            elif cmd == "/add":         self._cmd_add(args)
+            elif cmd == "/remove":      self._cmd_remove(args)
+            elif cmd == "/screen":      self._cmd_screen()
+            elif cmd == "/screenstock": self._cmd_screenstock(chat_id, args)
+            elif cmd == "/pause":       self._cmd_pause()
+            elif cmd == "/resume":      self._cmd_resume()
+            elif cmd == "/killswitch":  self._cmd_killswitch(args)
+            elif cmd == "/buy":         self._cmd_buy(chat_id, args)
+            elif cmd == "/sell":        self._cmd_sell(chat_id, args)
+            elif cmd == "/cancel":      self._cmd_cancel(chat_id)
             else:
-                self._reply(
-                    "Commands:\n"
-                    "/watchlist  /universe  /orders  /positions  /pnl  /cash\n"
-                    "/buy TICKER  /sell TICKER  /cancel\n"
-                    "/add TICKER  /remove TICKER  /screen"
-                )
+                self._reply("Unknown command. Send /help for a full list of commands.")
 
         elif conv:
             self._handle_conversation(chat_id, text, conv)
@@ -214,6 +255,51 @@ class TelegramCommandListener:
         elif flow == "sell"   and step == "confirm": self._sell_step_confirm(chat_id, text, conv)
         elif flow == "cancel" and step == "select":  self._cancel_step_select(chat_id, text, conv)
 
+    # ── /help ─────────────────────────────────────────────────────────────────
+
+    def _cmd_help(self) -> None:
+        self._reply(
+            "📖 <b>Available Commands</b>\n"
+            "\n"
+            "ℹ️ <b>Info</b>\n"
+            "/signals — latest bot signals for watchlist\n"
+            "/news TICKER — recent news + sentiment\n"
+            "/chart TICKER — technical indicators\n"
+            "/summary — full account snapshot\n"
+            "/history — last 10 closed trades\n"
+            "/status — VPS service status\n"
+            "/cash — available cash\n"
+            "/positions — open positions with P&amp;L\n"
+            "/orders — open orders\n"
+            "/pnl — P&amp;L summary\n"
+            "\n"
+            "📋 <b>Watchlist</b>\n"
+            "/watchlist — view active watchlist\n"
+            "/add TICKER — add to watchlist\n"
+            "/remove TICKER — remove from watchlist\n"
+            "\n"
+            "🌐 <b>Universe</b>\n"
+            "/universe — view universe pool\n"
+            "/universe add TICKER — add to universe\n"
+            "/universe remove TICKER — remove from universe\n"
+            "/universe refresh — rebuild from market data\n"
+            "\n"
+            "🔍 <b>Screening</b>\n"
+            "/screen — run momentum screener now\n"
+            "/screenstock TICKER — full 7-agent analysis\n"
+            "\n"
+            "💰 <b>Trading</b>\n"
+            "/buy TICKER — place a buy order\n"
+            "/sell TICKER — sell a position\n"
+            "/cancel — cancel an open order\n"
+            "\n"
+            "⚙️ <b>Bot Control</b>\n"
+            "/pause — pause trading (analysis continues)\n"
+            "/resume — resume trading\n"
+            "/killswitch on — halt all trading immediately\n"
+            "/killswitch off — resume after kill switch"
+        )
+
     # ── Info commands ─────────────────────────────────────────────────────────
 
     def _cmd_watchlist(self) -> None:
@@ -227,9 +313,307 @@ class TelegramCommandListener:
         lines.append("\nBot will trade these at next scheduled run.")
         self._reply("\n".join(lines))
 
+    def _cmd_signals(self) -> None:
+        tickers = self._read_file(self._watchlist_path)
+        if not tickers:
+            self._reply("📋 Watchlist is empty. Use /add TICKER to add tickers.")
+            return
+
+        lines     = ["📡 <b>Latest Signals:</b>"]
+        last_time = None
+        min_conf  = float(os.getenv("MIN_CONFIDENCE_SCORE", "7.0"))
+
+        for ticker in tickers:
+            files = sorted(
+                _LOG_DIR.glob(f"{ticker}_*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not files:
+                lines.append(f"{ticker:<6}→ No analysis yet")
+                continue
+            try:
+                data     = json.loads(files[0].read_text(encoding="utf-8"))
+                decision = data.get("decision", {})
+                action   = decision.get("action", "?")
+                conf     = float(decision.get("confidence", 0.0))
+                logged   = data.get("logged_at", "")
+
+                if action in ("BUY", "SELL") and conf >= min_conf:
+                    flag = "✅ (above threshold)"
+                elif action == "HOLD":
+                    flag = "⏸"
+                else:
+                    flag = ""
+
+                lines.append(f"{ticker:<6}→ {action:<4} {conf:.1f}/10 {flag}")
+
+                if logged and (last_time is None or logged > last_time):
+                    last_time = logged
+            except Exception:
+                lines.append(f"{ticker:<6}→ Error reading log")
+
+        if last_time:
+            try:
+                dt      = datetime.fromisoformat(last_time.replace("Z", "+00:00"))
+                sgt_str = dt.astimezone(_SGT).strftime("%Y-%m-%d %H:%M SGT")
+                lines.append(f"\nLast analysed: {sgt_str}")
+            except Exception:
+                pass
+
+        self._reply("\n".join(lines))
+
+    def _cmd_news(self, args: list) -> None:
+        if not args:
+            self._reply("Usage: /news TICKER (e.g. /news NVDA)")
+            return
+        ticker = args[0].upper()
+        self._reply(f"📰 Fetching news for {ticker}…")
+
+        try:
+            from data.finnhub import FinnhubClient
+            fh      = FinnhubClient()
+            to_date = datetime.utcnow().strftime("%Y-%m-%d")
+            from_dt = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+            news    = fh.get_company_news(ticker, from_dt, to_date)[:5]
+            raw_sent = fh.get_news_sentiment(ticker)
+        except Exception as exc:
+            self._reply(f"❌ Finnhub unavailable: {exc}")
+            return
+
+        if not news:
+            self._reply(f"📰 No recent news found for {ticker}.")
+            return
+
+        _POSITIVE = {"beat", "surge", "gain", "rise", "strong", "positive",
+                     "upgrade", "buy", "bull", "record", "profit", "growth"}
+        _NEGATIVE = {"miss", "fall", "drop", "decline", "weak", "negative",
+                     "downgrade", "sell", "bear", "loss", "warning", "cut"}
+
+        lines    = [f"📰 <b>{ticker} News:</b>"]
+        positive = 0
+        for i, article in enumerate(news, 1):
+            headline = article.get("headline") or ""
+            h_lower  = headline.lower()
+            if any(w in h_lower for w in _POSITIVE):
+                tone = "POSITIVE"
+                positive += 1
+            elif any(w in h_lower for w in _NEGATIVE):
+                tone = "NEGATIVE"
+            else:
+                tone = "NEUTRAL"
+            lines.append(f"{i}. [{tone}] {headline[:80]}")
+
+        bull_pct = (raw_sent.get("sentiment") or {}).get("bullishPercent") or 0
+        if bull_pct > 0.6:
+            sent_label = f"🟢 Bullish ({bull_pct:.0%} positive)"
+        elif bull_pct > 0.4:
+            sent_label = f"🟡 Neutral ({bull_pct:.0%} positive)"
+        else:
+            sent_label = f"🔴 Bearish ({bull_pct:.0%} positive)"
+
+        lines.append(f"Sentiment: {sent_label} ({positive}/{len(news)} positive)")
+        self._reply("\n".join(lines))
+
+    def _cmd_chart(self, args: list) -> None:
+        if not args:
+            self._reply("Usage: /chart TICKER (e.g. /chart NVDA)")
+            return
+        ticker = args[0].upper()
+        self._reply(f"📈 Fetching chart data for {ticker}…")
+
+        try:
+            import pandas as pd
+            import yfinance as yf
+
+            hist = yf.Ticker(ticker).history(period="60d", interval="1d", auto_adjust=True)
+            if hist.empty:
+                self._reply(f"❌ No price data for {ticker}.")
+                return
+
+            close = hist["Close"]
+            price = float(close.iloc[-1])
+            vol   = float(hist["Volume"].iloc[-1])
+            avg_vol  = float(hist["Volume"].rolling(20).mean().iloc[-1])
+            vol_ratio = vol / avg_vol if avg_vol > 0 else 0.0
+
+            ema20 = float(close.ewm(span=20, min_periods=20).mean().iloc[-1])
+            ema50_series = close.ewm(span=50, min_periods=50).mean()
+            ema50_val = ema50_series.iloc[-1]
+            ema50 = float(ema50_val) if pd.notna(ema50_val) else None
+
+            # RSI(14) via Wilder smoothing
+            delta    = close.diff()
+            avg_gain = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+            avg_loss = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+            rs       = avg_gain / avg_loss.replace(0, float("nan"))
+            rsi      = float((100 - 100 / (1 + rs)).iloc[-1])
+
+            # MACD(12,26,9)
+            ema12   = close.ewm(span=12, min_periods=12).mean()
+            ema26   = close.ewm(span=26, min_periods=26).mean()
+            macd    = ema12 - ema26
+            sig_ln  = macd.ewm(span=9, min_periods=9).mean()
+            macd_bullish = float(macd.iloc[-1]) > float(sig_ln.iloc[-1])
+
+            support    = float(hist["Low"].rolling(20).min().iloc[-1])
+            resistance = float(hist["High"].rolling(20).max().iloc[-1])
+
+        except Exception as exc:
+            self._reply(f"❌ Could not fetch chart data for {ticker}: {exc}")
+            return
+
+        if rsi > 70:
+            rsi_label = "Overbought ⚠️"
+        elif rsi < 30:
+            rsi_label = "Oversold ⚠️"
+        else:
+            rsi_label = "Neutral"
+
+        above20 = "✅" if price > ema20 else "❌"
+        ema50_line = (
+            f"EMA50:      ${ema50:,.2f} (price {'above' if price > ema50 else 'below'} "
+            f"{'✅' if price > ema50 else '❌'})"
+            if ema50 is not None else "EMA50:      n/a (< 50 bars)"
+        )
+
+        self._reply(
+            f"📈 <b>{ticker} Technical Summary:</b>\n"
+            f"Price:      ${price:,.2f}\n"
+            f"RSI(14):    {rsi:.1f} — {rsi_label}\n"
+            f"EMA20:      ${ema20:,.2f} (price {'above' if price > ema20 else 'below'} {above20})\n"
+            f"{ema50_line}\n"
+            f"MACD:       {'Bullish crossover ✅' if macd_bullish else 'Bearish crossover ❌'}\n"
+            f"Support:    ${support:,.2f}\n"
+            f"Resistance: ${resistance:,.2f}\n"
+            f"Volume:     {vol_ratio:.1f}x average {'✅' if vol_ratio >= 1.5 else ''}"
+        )
+
+    def _cmd_summary(self) -> None:
+        try:
+            mm        = self._make_executor()
+            positions = mm.get_positions()
+            orders    = mm.get_open_orders()
+            balance   = mm.get_account_balance()
+            mm.close()
+        except Exception as exc:
+            self._reply(f"❌ MooMoo unavailable: {exc}")
+            return
+
+        us        = balance.get("by_market", {}).get("US", {})
+        cash      = us.get("cash", balance.get("cash", 0.0))
+        equity    = us.get("total_assets", balance.get("portfolio_value", 0.0))
+        today_pnl = sum(p.get("today_pnl", 0.0) for p in positions)
+
+        if _KILL_SWITCH.exists():
+            ks_status = "🔴 ON — trading halted"
+        elif _PAUSE_LOCK.exists():
+            ks_status = "⏸ PAUSED"
+        else:
+            ks_status = "✅ OFF"
+
+        lines = [
+            "📊 <b>Account Summary:</b>",
+            f"💵 Cash:     ${cash:,.2f}",
+            f"📈 Equity:   ${equity:,.2f}",
+            f"📊 P&amp;L Today: ${_sign(today_pnl)}{today_pnl:,.2f}",
+            "",
+            f"📋 Positions: {len(positions)} open",
+        ]
+        for p in positions:
+            ticker = p.get("display_ticker") or _display_ticker(p.get("ticker", ""))
+            qty    = p.get("quantity", 0)
+            upnl   = p.get("unrealised_pnl", 0.0)
+            lines.append(
+                f"  {ticker}: {qty} share{'s' if qty != 1 else ''}, "
+                f"P&amp;L ${_sign(upnl)}{upnl:,.2f}"
+            )
+
+        lines.extend(["", f"📋 Orders: {len(orders)} pending"])
+        for o in orders:
+            ticker = o.get("ticker") or _display_ticker(o.get("code", ""))
+            lines.append(
+                f"  {o.get('action','')} {o.get('quantity',0)}x {ticker} "
+                f"— {o.get('status','')}"
+            )
+
+        last_run = self._get_last_run_time()
+        next_run = self._get_next_run_time()
+        lines.extend([
+            "",
+            "🤖 <b>Bot Status:</b>",
+            f"  Last run: {last_run}",
+            f"  Next run: {next_run}",
+            f"  Kill switch: {ks_status}",
+        ])
+        self._reply("\n".join(lines))
+
+    def _cmd_history(self) -> None:
+        if not _TRADES_CSV.exists():
+            self._reply("📜 No trade history yet.")
+            return
+
+        rows: list = []
+        try:
+            with open(_TRADES_CSV, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    rows.append(row)
+        except Exception as exc:
+            self._reply(f"❌ Could not read trade history: {exc}")
+            return
+
+        if not rows:
+            self._reply("📜 No trade history yet.")
+            return
+
+        last10 = rows[-10:][::-1]
+        lines  = ["📜 <b>Trade History (last 10):</b>"]
+        for i, row in enumerate(last10, 1):
+            ticker = row.get("ticker", "?")
+            action = row.get("action", "?")
+            qty    = row.get("quantity", "?")
+            ts     = (row.get("timestamp") or "")[:10]
+            try:
+                price_str = f"${float(row.get('price', 0)):,.2f}"
+            except (ValueError, TypeError):
+                price_str = row.get("price", "?")
+            lines.append(f"{i}. {ticker} {action} {qty}x @ {price_str} | {ts}")
+
+        self._reply("\n".join(lines))
+
+    def _cmd_status(self) -> None:
+        services = {
+            "Trading Bot":   "scheduler.py",
+            "Price Monitor": "price_monitor.py",
+            "FutuOpenD":     "FutuOpenD",
+            "Dashboard":     "dashboard.py",
+        }
+
+        lines = ["🖥 <b>System Status:</b>"]
+        for name, proc in services.items():
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", proc],
+                    capture_output=True, timeout=5,
+                )
+                icon = "✅" if result.returncode == 0 else "❌"
+                state = "running" if result.returncode == 0 else "not running"
+                lines.append(f"{icon} {name:<16} {state}")
+            except Exception:
+                lines.append(f"❓ {name:<16} unknown")
+
+        last_run = self._get_last_run_time()
+        next_run = self._get_next_run_time()
+        lines.extend([
+            f"Last run:    {last_run}",
+            f"Next run:    {next_run}",
+        ])
+        self._reply("\n".join(lines))
+
     def _cmd_orders(self) -> None:
         try:
-            mm = self._make_executor()
+            mm     = self._make_executor()
             orders = mm.get_open_orders()
             mm.close()
         except Exception as exc:
@@ -245,7 +629,8 @@ class TelegramCommandListener:
             ticker = o.get("ticker") or _display_ticker(o.get("code", ""))
             action = o.get("action", "")
             qty    = o.get("quantity", 0)
-            otype  = "@ market" if "MARKET" in o.get("order_type", "").upper() else f"@ ${o.get('price', 0):,.2f}"
+            otype  = ("@ market" if "MARKET" in o.get("order_type", "").upper()
+                      else f"@ ${o.get('price', 0):,.2f}")
             status = o.get("status", "")
             lines.append(
                 f"{i}. {action} {qty:,}x {ticker} {otype} — {status}\n"
@@ -255,7 +640,7 @@ class TelegramCommandListener:
 
     def _cmd_positions(self) -> None:
         try:
-            mm = self._make_executor()
+            mm        = self._make_executor()
             positions = mm.get_positions()
             mm.close()
         except Exception as exc:
@@ -266,7 +651,7 @@ class TelegramCommandListener:
             self._reply("📊 No open positions.")
             return
 
-        lines   = ["📊 <b>Open Positions:</b>"]
+        lines      = ["📊 <b>Open Positions:</b>"]
         total_upnl = 0.0
 
         for i, p in enumerate(positions, 1):
@@ -293,7 +678,7 @@ class TelegramCommandListener:
 
     def _cmd_pnl(self) -> None:
         try:
-            mm = self._make_executor()
+            mm        = self._make_executor()
             positions = mm.get_positions()
             balance   = mm.get_account_balance()
             mm.close()
@@ -301,10 +686,10 @@ class TelegramCommandListener:
             self._reply(f"❌ MooMoo unavailable: {exc}")
             return
 
-        today_total   = sum(p.get("today_pnl", 0.0)      for p in positions)
-        unreal_total  = sum(p.get("unrealised_pnl", 0.0)  for p in positions)
-        us            = balance.get("by_market", {}).get("US", {})
-        equity        = us.get("total_assets", balance.get("portfolio_value", 0.0))
+        today_total  = sum(p.get("today_pnl", 0.0)     for p in positions)
+        unreal_total = sum(p.get("unrealised_pnl", 0.0) for p in positions)
+        us           = balance.get("by_market", {}).get("US", {})
+        equity       = us.get("total_assets", balance.get("portfolio_value", 0.0))
 
         lines = ["💰 <b>P&amp;L Summary</b>", "", "<b>Today:</b>"]
         for p in positions:
@@ -378,6 +763,22 @@ class TelegramCommandListener:
         else:
             self._reply("❌ Screener not available")
 
+    def _cmd_screenstock(self, chat_id: str, args: list) -> None:
+        if not args:
+            self._reply("Usage: /screenstock TICKER (e.g. /screenstock NVDA)")
+            return
+        ticker = args[0].upper()
+        self._reply(
+            f"🔍 Running deep analysis on {ticker}…\n"
+            "This takes 2-3 minutes ⏳"
+        )
+        threading.Thread(
+            target=self._run_screenstock_safely,
+            args=(ticker,),
+            name=f"screenstock-{ticker}",
+            daemon=True,
+        ).start()
+
     def _cmd_universe(self, args: list) -> None:
         subcmd  = args[0].lower() if args else "list"
         subargs = args[1:]
@@ -444,6 +845,62 @@ class TelegramCommandListener:
         else:
             self._reply("❌ Universe refresh not configured")
 
+    # ── Bot control commands ──────────────────────────────────────────────────
+
+    def _cmd_pause(self) -> None:
+        if _PAUSE_LOCK.exists():
+            self._reply("⏸ Bot is already paused.\nSend /resume to re-enable trading.")
+            return
+        try:
+            _PAUSE_LOCK.touch()
+            self._reply(
+                "⏸ <b>Bot paused</b> — analysis will continue but no new trades "
+                "will be placed.\nSend /resume to re-enable trading."
+            )
+        except Exception as exc:
+            self._reply(f"❌ Failed to pause: {exc}")
+
+    def _cmd_resume(self) -> None:
+        if not _PAUSE_LOCK.exists():
+            self._reply("▶️ Bot is not paused. Trading is already active.")
+            return
+        try:
+            _PAUSE_LOCK.unlink()
+            self._reply("▶️ <b>Bot resumed</b> — trading re-enabled.")
+        except Exception as exc:
+            self._reply(f"❌ Failed to resume: {exc}")
+
+    def _cmd_killswitch(self, args: list) -> None:
+        subcmd = args[0].lower() if args else ""
+        if subcmd == "on":
+            if _KILL_SWITCH.exists():
+                self._reply("🚨 Kill switch is already ACTIVE.")
+                return
+            try:
+                _KILL_SWITCH.touch()
+                self._reply(
+                    "🚨 <b>Kill switch ACTIVATED</b>\n"
+                    "All trading halted immediately.\n"
+                    "Send /killswitch off to resume."
+                )
+            except Exception as exc:
+                self._reply(f"❌ Failed: {exc}")
+        elif subcmd == "off":
+            if not _KILL_SWITCH.exists():
+                self._reply("✅ Kill switch is already OFF.")
+                return
+            try:
+                _KILL_SWITCH.unlink()
+                self._reply("✅ <b>Kill switch DEACTIVATED</b>\nTrading resumed.")
+            except Exception as exc:
+                self._reply(f"❌ Failed: {exc}")
+        else:
+            self._reply(
+                "Usage:\n"
+                "/killswitch on  — halt all trading\n"
+                "/killswitch off — resume trading"
+            )
+
     # ── /buy flow ─────────────────────────────────────────────────────────────
 
     def _cmd_buy(self, chat_id: str, args: list) -> None:
@@ -452,11 +909,8 @@ class TelegramCommandListener:
             return
         ticker = args[0].upper()
 
-        if self._kill_switch_active():
-            self._reply(
-                "🚫 Kill switch is active. Trading is paused.\n"
-                "Go to dashboard to deactivate."
-            )
+        if self._trading_halted():
+            self._reply(self._trading_halted_msg())
             return
 
         self._reply(f"⏳ Fetching price for {ticker}…")
@@ -492,7 +946,6 @@ class TelegramCommandListener:
         price  = conv["price"]
         atr    = conv["atr"]
 
-        # ATR-based SL/TP
         if atr > 0:
             sl_price = price - atr * _ATR_SL_MULT
             tp_price = price + atr * _ATR_TP_MULT
@@ -578,12 +1031,9 @@ class TelegramCommandListener:
             self._reply("Reply <b>confirm</b> to place or <b>cancel</b> to abort.")
             return
 
-        if self._kill_switch_active():
+        if self._trading_halted():
             self._end_conv(chat_id)
-            self._reply(
-                "🚫 Kill switch is active. Trading is paused.\n"
-                "Go to dashboard to deactivate."
-            )
+            self._reply(self._trading_halted_msg())
             return
 
         ticker   = conv["ticker"]
@@ -603,7 +1053,6 @@ class TelegramCommandListener:
 
             oid = order.get("order_id") or order.get("id", "—")
 
-            # Bracket orders
             sl_oid = tp_oid = ""
             try:
                 sl_ord = mm.place_order(ticker=ticker, action="SELL",
@@ -642,11 +1091,8 @@ class TelegramCommandListener:
             return
         ticker = args[0].upper()
 
-        if self._kill_switch_active():
-            self._reply(
-                "🚫 Kill switch is active. Trading is paused.\n"
-                "Go to dashboard to deactivate."
-            )
+        if self._trading_halted():
+            self._reply(self._trading_halted_msg())
             return
 
         try:
@@ -657,7 +1103,6 @@ class TelegramCommandListener:
             self._reply(f"❌ MooMoo unavailable: {exc}")
             return
 
-        # Match position by display ticker or raw Futu code
         pos = next(
             (p for p in positions
              if (p.get("display_ticker") or _display_ticker(p.get("ticker", "")))
@@ -732,12 +1177,9 @@ class TelegramCommandListener:
             self._reply("Reply <b>confirm</b> to place or <b>cancel</b> to abort.")
             return
 
-        if self._kill_switch_active():
+        if self._trading_halted():
             self._end_conv(chat_id)
-            self._reply(
-                "🚫 Kill switch is active. Trading is paused.\n"
-                "Go to dashboard to deactivate."
-            )
+            self._reply(self._trading_halted_msg())
             return
 
         ticker = conv["ticker"]
@@ -784,7 +1226,7 @@ class TelegramCommandListener:
             qty    = o.get("quantity", 0)
             status = o.get("status", "")
             lines.append(f"{i}. {action} {qty:,}x {ticker} — {status}")
-        lines.append('\nReply with number (e.g. \'1\')')
+        lines.append("\nReply with number (e.g. '1')")
 
         self._start_conv(chat_id, "cancel", "select", orders=orders)
         self._reply("\n".join(lines))
@@ -796,9 +1238,7 @@ class TelegramCommandListener:
             if not (0 <= idx < len(orders)):
                 raise ValueError
         except ValueError:
-            self._reply(
-                f"❌ Enter a number between 1 and {len(orders)}."
-            )
+            self._reply(f"❌ Enter a number between 1 and {len(orders)}.")
             return
 
         o      = orders[idx]
@@ -858,6 +1298,63 @@ class TelegramCommandListener:
     def _kill_switch_active(self) -> bool:
         return _KILL_SWITCH.exists()
 
+    def _pause_active(self) -> bool:
+        return _PAUSE_LOCK.exists()
+
+    def _trading_halted(self) -> bool:
+        return _KILL_SWITCH.exists() or _PAUSE_LOCK.exists()
+
+    def _trading_halted_msg(self) -> str:
+        if _KILL_SWITCH.exists():
+            return (
+                "🚫 Trading is halted (kill switch active).\n"
+                "Send /killswitch off to re-enable."
+            )
+        if _PAUSE_LOCK.exists():
+            return (
+                "🚫 Trading is paused.\n"
+                "Send /resume to re-enable."
+            )
+        return ""
+
+    def _get_last_run_time(self) -> str:
+        """Return the most recent log file's timestamp as SGT string."""
+        try:
+            files = list(_LOG_DIR.glob("*.json"))
+            if not files:
+                return "No runs yet"
+            latest = max(files, key=lambda p: p.stat().st_mtime)
+            mtime  = datetime.fromtimestamp(latest.stat().st_mtime, tz=_SGT)
+            return mtime.strftime("%Y-%m-%d %H:%M SGT")
+        except Exception:
+            return "Unknown"
+
+    def _get_next_run_time(self) -> str:
+        """Return the next scheduled run time (SGT) based on hardcoded schedule."""
+        try:
+            now = datetime.now(_SGT)
+            # Build candidate datetimes for today and tomorrow
+            candidates: list[datetime] = []
+            for day_offset in range(7):
+                candidate_date = now.date() + timedelta(days=day_offset)
+                weekday = candidate_date.weekday()  # 0=Mon, 6=Sun
+                if weekday >= 5:
+                    continue
+                for hour, minute in _SCHEDULE_TIMES:
+                    dt = datetime(
+                        candidate_date.year, candidate_date.month, candidate_date.day,
+                        hour, minute, tzinfo=_SGT,
+                    )
+                    if dt > now:
+                        candidates.append(dt)
+
+            if not candidates:
+                return "Unknown"
+            next_dt = min(candidates)
+            return next_dt.strftime("%Y-%m-%d %H:%M SGT")
+        except Exception:
+            return "Unknown"
+
     def _start_conv(self, chat_id: str, flow: str, step: str, **data) -> None:
         self._conversations[chat_id] = {
             "flow":       flow,
@@ -893,6 +1390,94 @@ class TelegramCommandListener:
         except Exception as exc:
             logger.error("[TelegramListener] /universe refresh error: %s", exc, exc_info=True)
             self._reply(f"❌ Universe refresh error: {exc}")
+
+    def _run_screenstock_safely(self, ticker: str) -> None:
+        try:
+            from data.fetcher import DataFetcher
+            from agents.trading_agents import TradingAgentsWrapper
+
+            data     = DataFetcher().fetch(ticker)
+            decision = TradingAgentsWrapper().analyse(data)
+
+            action = decision.get("action", "?")
+            conf   = float(decision.get("confidence", 0.0))
+            flags  = decision.get("risk_flags", [])
+
+            # Risk level
+            _CRITICAL = {"halt", "delist", "fraud", "bankruptcy"}
+            if any(any(c in f.lower() for c in _CRITICAL) for f in flags):
+                risk = "HIGH ⚠️"
+            elif conf >= 8.0:
+                risk = "LOW"
+            else:
+                risk = "MEDIUM"
+
+            # Technical summary from raw data
+            tech      = data.get("technicals", {}) or {}
+            rsi       = tech.get("rsi_14")
+            macd_val  = tech.get("macd")
+            macd_sig  = tech.get("macd_signal")
+            tech_parts: list[str] = []
+            if rsi is not None:
+                if rsi > 70:
+                    tech_parts.append(f"RSI {rsi:.0f} overbought")
+                elif rsi < 30:
+                    tech_parts.append(f"RSI {rsi:.0f} oversold")
+                else:
+                    tech_parts.append(f"RSI {rsi:.0f}")
+            if macd_val is not None and macd_sig is not None:
+                tech_parts.append(
+                    "MACD bullish" if macd_val > macd_sig else "MACD bearish"
+                )
+            tech_str = ", ".join(tech_parts) if tech_parts else "data unavailable"
+
+            # Sentiment summary
+            sent     = data.get("sentiment", {}) or {}
+            bull_pct = sent.get("score") or 0
+            if bull_pct > 0.6:
+                sent_str = f"Bullish ({bull_pct:.0%})"
+            elif bull_pct > 0.4:
+                sent_str = "Neutral"
+            else:
+                sent_str = f"Bearish ({bull_pct:.0%})"
+
+            icon = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "⏸")
+
+            lines = [
+                f"🔍 <b>Deep Analysis: {ticker}</b>",
+                "",
+                f"Confidence:  {conf:.1f}/10",
+                f"Signal:      {icon} {action}",
+                f"Risk:        {risk}",
+                "",
+                "Agent Summary:",
+                f"📈 Technical:    {tech_str}",
+                f"📰 Sentiment:    {sent_str}",
+                f"🐂 Bull case:    {(decision.get('bull_case') or 'N/A')[:100]}",
+                f"🐻 Bear case:    {(decision.get('bear_case') or 'N/A')[:100]}",
+                f"✅ Fund Manager: {action} with {conf:.1f} confidence",
+            ]
+
+            reasoning = (decision.get("reasoning") or "").strip()
+            if reasoning:
+                lines.append(f"\n{reasoning[:200]}")
+
+            if flags:
+                lines.append(f"\n⚠️ Risk flags: {', '.join(flags[:3])}")
+
+            if action in ("BUY", "SELL"):
+                lines.extend(["", "Would you like to:"])
+                if action == "BUY":
+                    lines.append(f"/buy {ticker} — place a trade now")
+                    lines.append(f"/add {ticker} — add to active watchlist")
+                else:
+                    lines.append(f"/sell {ticker} — place a sell order")
+
+            self._reply("\n".join(lines))
+
+        except Exception as exc:
+            logger.error("[TelegramListener] /screenstock error: %s", exc, exc_info=True)
+            self._reply(f"❌ Analysis failed for {ticker}: {exc}")
 
     # ── File I/O ──────────────────────────────────────────────────────────────
 
