@@ -41,7 +41,6 @@ agents/memory/
 htmlcov/
 
 # Personal watchlist (edit locally, not committed)
-watchlist.txt
 
 # Secrets (never commit these)
 *.pem
