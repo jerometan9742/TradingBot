@@ -244,6 +244,66 @@ class MooMooConnector:
             )
             return None
 
+    def get_order_status(self, order_id: str, ticker: str) -> dict:
+        """
+        Query the current fill status of an open or recently filled order.
+
+        Args:
+            order_id: Futu order ID returned by place_order
+            ticker:   Stock symbol — used to select the correct market context
+
+        Returns:
+            {
+                "order_id":   str,
+                "status":     str,   # e.g. "FILLED_ALL", "SUBMITTED", "FAILED"
+                "fill_price": float, # average fill price; 0.0 if not yet filled
+                "fill_qty":   int,   # shares filled so far
+            }
+        """
+        ft     = self._ft
+        _empty = {
+            "order_id":   order_id,
+            "status":     "UNKNOWN",
+            "fill_price": 0.0,
+            "fill_qty":   0,
+        }
+        try:
+            ctx = self._ctx_for_ticker(ticker)
+            ret, data = ctx.order_list_query(
+                order_id=order_id,
+                trd_env=self._trd_env,
+            )
+            if ret != ft.RET_OK:
+                logger.warning(
+                    "[MooMoo] order_list_query failed (id=%s): %s", order_id, data
+                )
+                return _empty
+
+            if not (hasattr(data, "iloc") and len(data) > 0):
+                return _empty
+
+            row        = data.iloc[0].to_dict()
+            status     = str(row.get("order_status", "UNKNOWN"))
+            fill_price = float(row.get("dealt_avg_price", 0) or 0)
+            fill_qty   = int(float(row.get("dealt_qty", 0) or 0))
+
+            logger.debug(
+                "[MooMoo] Order %s — status=%s  fill_price=%.4f  fill_qty=%d",
+                order_id, status, fill_price, fill_qty,
+            )
+            return {
+                "order_id":   order_id,
+                "status":     status,
+                "fill_price": fill_price,
+                "fill_qty":   fill_qty,
+            }
+
+        except Exception as exc:
+            logger.warning(
+                "[MooMoo] get_order_status error (id=%s): %s", order_id, exc
+            )
+            return _empty
+
     def cancel_order(self, order_id: str) -> bool:
         """
         Cancel a single open order by ID.

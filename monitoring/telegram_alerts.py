@@ -69,25 +69,47 @@ class TelegramAlerter:
         confidence: float,
         mode: str = "PAPER",
     ) -> bool:
-        """Alert: a trade was successfully placed."""
-        icon  = "✅" if mode == "LIVE" else "📋"
-        qty   = sizing.get("quantity", 0)
-        price = sizing.get("entry_price", 0.0)
-        val   = sizing.get("position_value", 0.0)
-        pct   = sizing.get("position_pct", 0.0) * 100
-        sl    = sizing.get("stop_loss_price", 0.0)
-        tp    = sizing.get("take_profit_price", 0.0)
-        risk  = sizing.get("risk_amount", 0.0)
-        oid   = order.get("id", "—")
+        """Alert: an order has been submitted (not yet confirmed filled)."""
+        qty = sizing.get("quantity", 0)
+        oid = order.get("order_id") or order.get("id", "—")
 
         text = (
-            f"{icon} <b>TRADE PLACED — {mode} MODE</b>\n\n"
-            f"<b>{action} {qty} shares of {ticker}</b> @ ${price:,.2f}\n"
-            f"Position: ${val:,.0f} ({pct:.1f}% of portfolio)\n"
-            f"Stop loss: ${sl:,.2f}  |  Take profit: ${tp:,.2f}\n"
-            f"Risk: ${risk:,.2f}  |  Confidence: {confidence:.1f}/10\n\n"
+            f"📋 <b>Order Placed: {action} {qty:,} x {ticker} @ market price</b>\n"
             f"Order ID: <code>{oid}</code>\n"
+            f"Mode: {mode}"
+        )
+        return self._send(text)
+
+    def send_order_filled(
+        self,
+        ticker: str,
+        action: str,
+        quantity: int,
+        order_id: str,
+        fill_price: float,
+    ) -> bool:
+        """Alert: an order has been fully filled."""
+        text = (
+            f"✅ <b>Order Filled: {action} {quantity:,} x {ticker}"
+            f" @ ${fill_price:,.2f}</b>\n"
+            f"Order ID: <code>{order_id}</code>\n"
             f"Time: {_now_sgt()}"
+        )
+        return self._send(text)
+
+    def send_order_pending(
+        self,
+        ticker: str,
+        action: str,
+        quantity: int,
+        order_id: str,
+    ) -> bool:
+        """Alert: order not filled within the poll window (market closed / queued)."""
+        text = (
+            f"⏳ <b>Order Pending: {ticker}</b>\n"
+            f"{action} {quantity:,} x {ticker} order queued"
+            f" — will fill when market opens\n"
+            f"Order ID: <code>{order_id}</code>"
         )
         return self._send(text)
 
@@ -271,6 +293,25 @@ def send_trade_placed(
     mode: str = "PAPER",
 ) -> bool:
     return _alerter().send_trade_placed(ticker, action, sizing, order, confidence, mode)
+
+
+def send_order_filled(
+    ticker: str,
+    action: str,
+    quantity: int,
+    order_id: str,
+    fill_price: float,
+) -> bool:
+    return _alerter().send_order_filled(ticker, action, quantity, order_id, fill_price)
+
+
+def send_order_pending(
+    ticker: str,
+    action: str,
+    quantity: int,
+    order_id: str,
+) -> bool:
+    return _alerter().send_order_pending(ticker, action, quantity, order_id)
 
 
 def send_trade_blocked(

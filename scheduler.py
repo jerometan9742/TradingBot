@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -342,7 +343,10 @@ class TradingScheduler:
         from risk.risk_gate import RiskGate
         from risk.position_sizer import PositionSizer, PositionSizerError
         from monitoring.logger import log_decision, log_trade
-        from monitoring.telegram_alerts import send_trade_placed, send_trade_blocked
+        from monitoring.telegram_alerts import (
+            send_trade_placed, send_trade_blocked,
+            send_order_filled, send_order_pending,
+        )
 
         trading_mode = os.getenv("TRADING_MODE", "paper").upper()
         logger.info("[%s] ── Pipeline start ──────────────────────────", ticker)
@@ -449,6 +453,19 @@ class TradingScheduler:
         logger.info("[%s] Order placed — id=%s  status=%s",
                     ticker, oid, order.get("status"))
 
+        # 5a. "Order Placed" notification — sent immediately before waiting for fill
+        try:
+            send_trade_placed(
+                ticker=ticker,
+                action=decision["action"],
+                sizing=sizing,
+                order=order,
+                confidence=decision["confidence"],
+                mode=trading_mode,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Telegram order-placed alert failed: %s", ticker, exc)
+
         # 5b. Bracket orders for BUY (SL + TP limit sells)
         if decision["action"] == "BUY":
             sl_price = sizing["stop_loss_price"]
@@ -511,20 +528,100 @@ class TradingScheduler:
 
         self._refresh_portfolio(executor)
 
-        # 8. Telegram alert
-        try:
-            send_trade_placed(
-                ticker=ticker,
-                action=decision["action"],
-                sizing=sizing,
-                order=order,
-                confidence=decision["confidence"],
-                mode=trading_mode,
-            )
-        except Exception as exc:
-            logger.warning("[%s] Telegram trade alert failed: %s", ticker, exc)
+        # 8. Poll for fill → send "Order Filled" or "Order Pending"
+        self._poll_order_fill(
+            executor=executor,
+            order_id=oid,
+            ticker=ticker,
+            action=decision["action"],
+            quantity=sizing["quantity"],
+            send_filled=send_order_filled,
+            send_pending=send_order_pending,
+        )
 
         logger.info("[%s] ── Pipeline complete ─────────────────────────", ticker)
+
+    def _poll_order_fill(
+        self,
+        executor,
+        order_id: str,
+        ticker: str,
+        action: str,
+        quantity: int,
+        send_filled,
+        send_pending,
+        max_wait: int = 60,
+        interval: int = 5,
+    ) -> None:
+        """
+        Poll the broker for fill status every `interval` seconds for up to
+        `max_wait` seconds, then send the appropriate Telegram notification.
+
+        Only MooMooConnector exposes get_order_status(); all other brokers
+        (Alpaca, None) go straight to the "pending" alert since they either
+        fill asynchronously or status polling is not supported.
+        """
+        if not order_id:
+            logger.debug("[%s] No order_id — skipping fill poll", ticker)
+            return
+
+        if executor is None or not hasattr(executor, "get_order_status"):
+            logger.info(
+                "[%s] Broker does not support status polling — sending pending alert",
+                ticker,
+            )
+            try:
+                send_pending(ticker, action, quantity, order_id)
+            except Exception as exc:
+                logger.warning("[%s] Telegram pending alert failed: %s", ticker, exc)
+            return
+
+        logger.info(
+            "[%s] Polling for fill (order_id=%s, max=%ds, interval=%ds)",
+            ticker, order_id, max_wait, interval,
+        )
+        deadline = time.time() + max_wait
+
+        while time.time() < deadline:
+            time.sleep(interval)
+            try:
+                info = executor.get_order_status(order_id, ticker)
+            except Exception as exc:
+                logger.warning("[%s] get_order_status error: %s", ticker, exc)
+                continue
+
+            status = info.get("status", "")
+            logger.info("[%s] Order %s status: %s", ticker, order_id, status)
+
+            if "FILLED_ALL" in status:
+                fill_price = info.get("fill_price", 0.0)
+                logger.info(
+                    "[%s] Order filled — fill_price=$%.4f", ticker, fill_price
+                )
+                try:
+                    send_filled(ticker, action, quantity, order_id, fill_price)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Telegram filled alert failed: %s", ticker, exc
+                    )
+                return
+
+            # Terminal non-fill states — stop polling, no alert
+            if any(s in status for s in (
+                "CANCELLED", "FAILED", "SUBMIT_FAILED", "DELETED", "TIMEOUT"
+            )):
+                logger.warning(
+                    "[%s] Order %s ended with terminal status: %s",
+                    ticker, order_id, status,
+                )
+                return
+
+        # Poll window exhausted — order is still queued
+        logger.info("[%s] Order not filled within %ds — sending pending alert", ticker, max_wait)
+        try:
+            send_pending(ticker, action, quantity, order_id)
+        except Exception as exc:
+            logger.warning("[%s] Telegram pending alert failed: %s", ticker, exc)
 
 
 # ---------------------------------------------------------------------------
