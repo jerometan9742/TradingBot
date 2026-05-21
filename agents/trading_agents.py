@@ -173,6 +173,10 @@ You receive:
                          since, and a self-critical reflection on accuracy.
                          Use this to calibrate confidence, avoid repeating past
                          mistakes, and correct any systematic biases.
+- lessons_from_memory:   (optional) lessons extracted from past closed trades by
+                         the ReflectionEngine — specific patterns, calibration
+                         stats, and actionable guidance derived from real outcomes.
+                         Use these to avoid repeating documented mistakes.
 
 Make the final decision. You MUST respond with a single valid JSON object
 matching this schema exactly — no prose before or after the JSON:
@@ -455,6 +459,7 @@ class TradingAgentsWrapper:
 
         # ── Memory: load history, generate reflection, build context ──────
         history_context = ""
+        lessons_context = ""
         try:
             memory         = AgentMemory()
             past_decisions = memory.load_past_decisions(ticker, limit=5)
@@ -477,6 +482,15 @@ class TradingAgentsWrapper:
         except Exception as exc:
             logger.warning("[TradingAgents] Memory step failed for %s: %s", ticker, exc)
 
+        # ── ReflectionEngine: inject lessons from closed trades ───────────
+        try:
+            from agents.memory.reflection_engine import ReflectionEngine
+            lessons_context = ReflectionEngine().build_lessons_context(ticker)
+            if lessons_context:
+                logger.info("[TradingAgents] Loaded trade lessons for %s", ticker)
+        except Exception as exc:
+            logger.warning("[TradingAgents] ReflectionEngine failed for %s: %s", ticker, exc)
+
         # ── 7-agent pipeline ──────────────────────────────────────────────
         try:
             technical   = self._run_technical(data)
@@ -487,7 +501,7 @@ class TradingAgentsWrapper:
             risk        = self._run_risk(data, bull, bear)
             decision    = self._run_fund_manager(
                 ticker, technical, fundamental, sentiment, bull, bear, risk,
-                history_context,
+                history_context, lessons_context,
             )
         except Exception as exc:
             logger.error("[TradingAgents] Pipeline failed for %s: %s", ticker, exc, exc_info=True)
@@ -707,6 +721,7 @@ class TradingAgentsWrapper:
         bear: str,
         risk: str,
         history_context: str = "",
+        lessons_context: str = "",
     ) -> dict:
         logger.info("[FundManager] Making final decision...")
         payload_dict: dict = {
@@ -720,6 +735,8 @@ class TradingAgentsWrapper:
         }
         if history_context:
             payload_dict["past_decision_history"] = history_context
+        if lessons_context:
+            payload_dict["lessons_from_memory"] = lessons_context
         payload = json.dumps(payload_dict, indent=2)
         try:
             response = self.client.messages.create(

@@ -233,6 +233,9 @@ class TelegramCommandListener:
             elif cmd == "/pause":       self._cmd_pause()
             elif cmd == "/resume":      self._cmd_resume()
             elif cmd == "/killswitch":  self._cmd_killswitch(args)
+            elif cmd == "/lessons":     self._cmd_lessons()
+            elif cmd == "/reflect":     self._cmd_reflect(args)
+            elif cmd == "/memory":      self._cmd_memory(args)
             elif cmd == "/buy":         self._cmd_buy(chat_id, args)
             elif cmd == "/sell":        self._cmd_sell(chat_id, args)
             elif cmd == "/cancel":      self._cmd_cancel(chat_id)
@@ -285,6 +288,11 @@ class TelegramCommandListener:
             "/universe add TICKER — add to universe\n"
             "/universe remove TICKER — remove from universe\n"
             "/universe refresh — rebuild from market data\n"
+            "\n"
+            "🧠 <b>Memory &amp; Reflection</b>\n"
+            "/lessons — last 10 bot trade lessons\n"
+            "/reflect TICKER — reflect on last closed trade\n"
+            "/memory TICKER — all lessons for a ticker\n"
             "\n"
             "🔍 <b>Screening</b>\n"
             "/screen — run momentum screener now\n"
@@ -582,6 +590,106 @@ class TelegramCommandListener:
                 price_str = row.get("price", "?")
             lines.append(f"{i}. {ticker} {action} {qty}x @ {price_str} | {ts}")
 
+        self._reply("\n".join(lines))
+
+    def _cmd_lessons(self) -> None:
+        """Show the last 10 lessons from the ReflectionEngine."""
+        try:
+            from agents.memory.reflection_engine import ReflectionEngine
+            recent = ReflectionEngine().get_recent_lessons(limit=10)
+        except Exception as exc:
+            self._reply(f"❌ Could not load lessons: {exc}")
+            return
+
+        if not recent:
+            self._reply(
+                "🧠 <b>Bot Lessons</b>\n\nNo lessons yet — lessons appear after "
+                "the first closed trade is reflected on.\nUse /reflect TICKER to trigger."
+            )
+            return
+
+        lines = [f"🧠 <b>Bot Lessons (last {len(recent)}):</b>"]
+        for ref in recent:
+            outcome = "✅ WIN" if ref.get("outcome") == "WIN" else "❌ LOSS"
+            ticker  = ref.get("ticker", "?")
+            date    = ref.get("trade_date", "?")
+            lesson  = ref.get("key_lesson", "no lesson recorded")
+            conf    = ref.get("confidence_at_entry", "?")
+            lines.append(f"\n<b>{ticker}</b> {outcome} | {date} | conf {conf}")
+            lines.append(f"  💡 {lesson}")
+        self._reply("\n".join(lines))
+
+    def _cmd_reflect(self, args: list) -> None:
+        """Trigger /reflect TICKER — generate a reflection for the last closed trade."""
+        if not args:
+            self._reply("Usage: /reflect TICKER\nExample: /reflect AAPL")
+            return
+        ticker = args[0].upper()
+        self._reply(f"🔄 Reflecting on last closed {ticker} trade…")
+        try:
+            from agents.memory.reflection_engine import ReflectionEngine
+            ref = ReflectionEngine().reflect_on_last_trade(ticker)
+        except Exception as exc:
+            self._reply(f"❌ Reflection failed for {ticker}: {exc}")
+            return
+
+        if ref is None:
+            self._reply(
+                f"🧠 <b>{ticker}</b> — no closed trades found to reflect on.\n"
+                "A reflection is generated after a BUY is matched with a SELL in trades.csv."
+            )
+            return
+
+        outcome = "✅ WIN" if ref.get("outcome") == "WIN" else "❌ LOSS"
+        lines = [
+            f"🧠 <b>Reflection: {ticker}</b>",
+            f"{outcome} | {ref.get('trade_date', '?')} | conf {ref.get('confidence_at_entry', '?')}",
+            f"\n💡 <b>Key lesson:</b> {ref.get('key_lesson', 'n/a')}",
+            f"\n✔️ <b>Went right:</b> {ref.get('what_went_right', 'n/a')}",
+            f"✖️ <b>Went wrong:</b> {ref.get('what_went_wrong', 'n/a')}",
+            f"🔧 <b>Do differently:</b> {ref.get('do_differently', 'n/a')}",
+            f"\nCalibration: {ref.get('confidence_calibration', 'n/a')}",
+            f"Market: {ref.get('market_condition', 'n/a')}",
+            f"Exit: {ref.get('exit_reason', 'n/a')}",
+        ]
+        self._reply("\n".join(lines))
+
+    def _cmd_memory(self, args: list) -> None:
+        """Show all stored lessons for a specific ticker via /memory TICKER."""
+        if not args:
+            self._reply("Usage: /memory TICKER\nExample: /memory AAPL")
+            return
+        ticker = args[0].upper()
+        try:
+            from agents.memory.reflection_engine import ReflectionEngine
+            lessons = ReflectionEngine().get_lessons_for_ticker(ticker)
+        except Exception as exc:
+            self._reply(f"❌ Could not load memory for {ticker}: {exc}")
+            return
+
+        if not lessons:
+            self._reply(
+                f"🧠 <b>{ticker} memory</b>\n\nNo lessons stored yet for {ticker}."
+            )
+            return
+
+        wins  = sum(1 for r in lessons if r.get("outcome") == "WIN")
+        rate  = round(wins / len(lessons) * 100, 1) if lessons else 0.0
+        lines = [
+            f"🧠 <b>{ticker} memory</b> ({len(lessons)} trade(s), {rate}% win rate)",
+        ]
+        for ref in lessons:
+            outcome = "✅" if ref.get("outcome") == "WIN" else "❌"
+            date    = ref.get("trade_date", "?")
+            conf    = ref.get("confidence_at_entry", "?")
+            pnl     = ref.get("pnl", 0)
+            lesson  = ref.get("key_lesson", "n/a")
+            try:
+                pnl_str = f"${float(pnl):+.2f}"
+            except (TypeError, ValueError):
+                pnl_str = "?"
+            lines.append(f"\n{outcome} {date} | conf {conf} | P&amp;L {pnl_str}")
+            lines.append(f"  💡 {lesson}")
         self._reply("\n".join(lines))
 
     def _cmd_stats(self) -> None:

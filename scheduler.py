@@ -190,6 +190,15 @@ class TradingScheduler:
             replace_existing=True,
             misfire_grace_time=300,
         )
+        self._apscheduler.add_job(
+            func=self.run_weekly_learning_summary,
+            trigger=CronTrigger(day_of_week="sun", hour=9, minute=0,
+                                timezone=_TZ_SCHED),
+            id="weekly_learning_summary",
+            name="Weekly learning summary (09:00 SGT Sunday)",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
 
         # Start background order-status monitor thread
         monitor_thread = threading.Thread(
@@ -375,6 +384,74 @@ class TradingScheduler:
             send_market_close_summary(state, positions)
         except Exception as exc:
             logger.warning("[TradingScheduler] Telegram close-summary alert: %s", exc)
+
+    def run_weekly_learning_summary(self) -> None:
+        """
+        Sunday 09:00 SGT — generate a 7-day reflection summary and send via Telegram.
+        """
+        logger.info("[TradingScheduler] Weekly learning summary starting")
+        try:
+            from agents.memory.reflection_engine import ReflectionEngine
+            summary = ReflectionEngine().generate_weekly_summary()
+        except Exception as exc:
+            logger.error("[TradingScheduler] ReflectionEngine weekly summary failed: %s", exc)
+            return
+
+        total    = summary.get("total_trades", 0)
+        wins     = summary.get("wins", 0)
+        losses   = summary.get("losses", 0)
+        win_rate = summary.get("win_rate", 0.0)
+
+        if total == 0:
+            logger.info("[TradingScheduler] No closed trades in last 7 days — skipping Telegram")
+            return
+
+        best  = summary.get("best_trade", {})
+        worst = summary.get("worst_trade", {})
+        best_str  = (
+            f"{best.get('ticker','?')} ${float(best.get('pnl', 0)):+.2f}"
+            if best else "N/A"
+        )
+        worst_str = (
+            f"{worst.get('ticker','?')} ${float(worst.get('pnl', 0)):+.2f}"
+            if worst else "N/A"
+        )
+
+        patterns = summary.get("top_patterns", {})
+        pattern_str = ", ".join(
+            f"{tag}×{count}" for tag, count in list(patterns.items())[:3]
+        ) or "none"
+
+        warning = summary.get("warning_pattern", "")
+        new_lessons = summary.get("new_lessons", [])
+
+        lines = [
+            "📚 <b>Weekly Learning Summary</b>",
+            f"Period: last 7 days\n",
+            f"Trades: {total}  |  Wins: {wins}  |  Losses: {losses}",
+            f"Win rate: {win_rate}%",
+            f"Best trade:  {best_str}",
+            f"Worst trade: {worst_str}",
+        ]
+        if pattern_str != "none":
+            lines.append(f"Top patterns: {pattern_str}")
+        if warning:
+            lines.append(f"\n⚠️ Warning pattern in losses: {warning}")
+        if new_lessons:
+            lines.append("\n💡 <b>New lessons this week:</b>")
+            for lesson in new_lessons[:5]:
+                lines.append(f"  • {lesson}")
+
+        try:
+            from monitoring.telegram_alerts import TelegramAlerter
+            TelegramAlerter().send_text("\n".join(lines))
+        except Exception as exc:
+            logger.warning("[TradingScheduler] Telegram weekly summary alert failed: %s", exc)
+
+        logger.info(
+            "[TradingScheduler] Weekly summary sent — %d trades, %.1f%% win rate",
+            total, win_rate,
+        )
 
     # ------------------------------------------------------------------
     # Private helpers — pipeline
@@ -892,6 +969,19 @@ class TradingScheduler:
                     log_trade(ticker, "FILLED", quantity, fill_price, order_id)
                 except Exception as exc:
                     logger.warning("[OrderMonitor] log_trade FILLED failed: %s", exc)
+                # Trigger reflection after a SELL fill so lessons are captured
+                if action.upper() == "SELL":
+                    def _reflect(t: str = ticker) -> None:
+                        try:
+                            from agents.memory.reflection_engine import ReflectionEngine
+                            count = ReflectionEngine().run_pending_reflections()
+                            logger.info(
+                                "[OrderMonitor] Post-fill reflection complete — %d new reflection(s) for %s",
+                                count, t,
+                            )
+                        except Exception as exc:
+                            logger.warning("[OrderMonitor] Post-fill reflection failed for %s: %s", t, exc)
+                    threading.Thread(target=_reflect, name=f"reflect-{ticker}", daemon=True).start()
                 to_remove.append(order_id)
 
             elif "CANCELLED" in new_status:

@@ -20,7 +20,8 @@ build/
 # Logs & data
 *.log
 logs/
-agents/memory/
+agents/memory/*.json
+agents/memory/reflections/
 
 # IDE
 .vscode/

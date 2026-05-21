@@ -415,6 +415,10 @@ class TelegramAlerter:
 
     # ------------------------------------------------------------------
     # Internal
+    def send_text(self, text: str) -> bool:
+        """Send an arbitrary HTML-formatted message. Convenience wrapper around _send."""
+        return self._send(text)
+
     # ------------------------------------------------------------------
 
     def _send(self, text: str) -> bool:
