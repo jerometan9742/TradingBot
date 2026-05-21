@@ -8,9 +8,6 @@ TSLA
 META
 
 # US Finance
-JPM
+
 
 # SGX
-D05.SI
-O39.SI
-U11.SI
