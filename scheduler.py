@@ -183,7 +183,7 @@ class TradingScheduler:
         )
         self._apscheduler.add_job(
             func=self.market_close_cycle,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=4, minute=0,
+            trigger=CronTrigger(day_of_week="mon-sat", hour=4, minute=0,
                                 timezone=_TZ_SCHED),
             id="market_close",
             name="Market close P&L summary (04:00 SGT)",
