@@ -60,3 +60,64 @@ def test_fetch_handles_api_failure_gracefully(mock_fetcher):
     result = mock_fetcher.fetch("AAPL")
     assert result["quote"] == {}
     assert result["ticker"] == "AAPL"
+
+
+# ---------------------------------------------------------------------------
+# AlphaVantageClient.get_adx() unit tests
+# ---------------------------------------------------------------------------
+
+def test_get_adx_returns_float():
+    """get_adx() returns a positive float when the API responds correctly."""
+    import os
+    from unittest.mock import patch, MagicMock
+    from data.alpha_vantage import AlphaVantageClient
+
+    sample = {
+        "Technical Analysis: ADX": {
+            "2025-05-21": {"ADX": "28.1234"},
+            "2025-05-20": {"ADX": "27.5000"},
+        }
+    }
+    os.environ.setdefault("ALPHA_VANTAGE_API_KEY", "test_key")
+    with patch("data.alpha_vantage.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = sample
+        mock_resp.raise_for_status.return_value = None
+        mock_get.return_value = mock_resp
+        client = AlphaVantageClient()
+        result = client.get_adx("AAPL")
+
+    assert isinstance(result, float), f"Expected float, got {type(result)}"
+    assert result > 0, f"Expected positive ADX, got {result}"
+
+
+def test_get_adx_returns_none_on_api_error():
+    """get_adx() returns None gracefully when the API call fails."""
+    import os
+    from unittest.mock import patch
+    from data.alpha_vantage import AlphaVantageClient
+
+    os.environ.setdefault("ALPHA_VANTAGE_API_KEY", "test_key")
+    with patch("data.alpha_vantage.requests.get", side_effect=Exception("Network error")):
+        client = AlphaVantageClient()
+        result = client.get_adx("AAPL")
+
+    assert result is None
+
+
+def test_get_adx_returns_none_on_empty_series():
+    """get_adx() returns None when Alpha Vantage returns an empty data series."""
+    import os
+    from unittest.mock import patch, MagicMock
+    from data.alpha_vantage import AlphaVantageClient
+
+    os.environ.setdefault("ALPHA_VANTAGE_API_KEY", "test_key")
+    with patch("data.alpha_vantage.requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"Technical Analysis: ADX": {}}
+        mock_resp.raise_for_status.return_value = None
+        mock_get.return_value = mock_resp
+        client = AlphaVantageClient()
+        result = client.get_adx("AAPL")
+
+    assert result is None

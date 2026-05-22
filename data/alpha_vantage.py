@@ -136,3 +136,18 @@ class AlphaVantageClient:
             "interval": interval,
             "time_period": period,
         })
+
+    def get_adx(self, ticker: str, interval: str = "daily", period: int = 14) -> Optional[float]:
+        """Average Directional Index — returns the latest value, or None on error."""
+        try:
+            data = self._get({
+                "function": "ADX",
+                "symbol": ticker,
+                "interval": interval,
+                "time_period": period,
+            })
+            series = data.get("Technical Analysis: ADX", {})
+            latest_date = next(iter(series), None)
+            return float(series[latest_date]["ADX"]) if latest_date else None
+        except Exception:
+            return None

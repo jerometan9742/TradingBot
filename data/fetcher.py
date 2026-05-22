@@ -211,6 +211,7 @@ class DataFetcher:
                 "bb_middle":  float(bb_series[latest_bb_date]["Real Middle Band"])    if latest_bb_date   else None,
                 "bb_lower":   float(bb_series[latest_bb_date]["Real Lower Band"])     if latest_bb_date   else None,
                 "atr_14":     float(atr_series[latest_atr_date]["ATR"])               if latest_atr_date  else None,
+                "adx_14":     self.av.get_adx(ticker),
             }
         except Exception as e:
             logger.error("[DataFetcher] Technicals error (%s): %s", ticker, e)
