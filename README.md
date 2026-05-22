@@ -1,317 +1,488 @@
-# AI Trading Bot
+# Fred — AI Swing Trading Bot
 
-An autonomous stock analysis and trading system powered by Claude (Anthropic),
-TradingAgents (TauricResearch), and TradingView MCP.
+> Daily swing trading signal generator powered by Claude AI. Uses a 7-agent multi-agent debate pipeline to analyse US stocks, then routes decisions through a hard-guardrail risk gate before placing bracket orders via MooMoo/Futu.
 
-> ⚠️ **Disclaimer:** This project is for educational and research purposes.
-> Always paper trade before using real capital.
-> Nothing here constitutes financial or investment advice.
+> **For educational and research purposes only. Not financial advice. Always paper trade before using real capital.**
+
+---
+
+## What Fred Does
+
+Fred runs on a schedule on a VPS, analysing a configurable watchlist of US stocks:
+
+1. **Fetches live data** — real-time quotes, fundamentals, technicals, news, and sentiment from 5 data sources
+2. **Runs a 7-agent debate pipeline** — bull and bear researchers argue their cases; a Fund Manager decides BUY / HOLD / SELL with a confidence score (1–10)
+3. **Passes through a Risk Gate** — 7 hard guardrails block trades that don't meet criteria
+4. **Sizes positions** — fixed-fractional sizing scaled by confidence tier
+5. **Places bracket orders** — entry + stop-loss + take-profit submitted to MooMoo via FutuOpenD
+6. **Monitors 24/7** — a background service polls open positions every 60 seconds as a backup SL/TP enforcer
+7. **Alerts via Telegram** — every trade placed, blocked, or filled; daily P&L summary
+8. **Learns from trades** — post-trade Claude reflections update `lessons_learned.md`, injected into future sessions
 
 ---
 
 ## Architecture
 
 ```
-Data Layer                        Analysis Layer (7 Agents)                  Execution
-──────────                        ─────────────────────────                  ─────────
-TradingView MCP (port 9222)   →   Technical Analyst    ┐
-Finnhub API                   →   Fundamental Analyst  ├→ Bull/Bear → Risk Mgr → Fund Mgr → MooMoo / Futu
-Alpha Vantage                 →   Sentiment Analyst    ┘                                  → Alpaca (paper)
-FMP API
-NewsAPI
-CNN Fear & Greed Index
-yfinance (SGX / HK fallback)
+DATA LAYER
+──────────
+Alpha Vantage API       →  RSI, MACD, Bollinger Bands, ATR, ADX, OHLCV
+Finnhub API             →  Real-time quotes, news, earnings calendar, analyst targets
+FMP API                 →  Fundamentals, key ratios, earnings surprises
+yfinance                →  International tickers (.SI/.HK/.L etc), gap-fill for US
+NewsAPI                 →  Additional news articles (100 req/day free)
+CNN Fear & Greed Index  →  Market sentiment (free, no key required)
+
+ANALYSIS LAYER  (agents/trading_agents.py)
+──────────────────────────────────────────
+[Technical Analyst]    →  RSI, MACD, ADX, ATR, Bollinger Bands, trend direction
+[Fundamental Analyst]  →  P/E, revenue, margins, earnings quality, valuation
+[Sentiment Analyst]    →  News tone, Fear & Greed index, crowd sentiment
+[Bull Researcher]      →  Strongest bull case from all available data
+[Bear Researcher]      →  Strongest bear case from all available data
+[Risk Manager]         →  Risk/reward assessment; may veto or downgrade
+[Fund Manager]         →  Final BUY / HOLD / SELL + confidence score (1–10)
+
+RISK LAYER  (risk/)
+────────────────────
+RiskGate        →  7-check hard guardrail (confidence, kill switch, daily limits, flags)
+PositionSizer   →  Fixed-fractional sizing scaled by confidence tier; ATR-based SL/TP
+
+EXECUTION LAYER  (execution/)
+──────────────────────────────
+moomoo.py  →  Paper and live trading via FutuOpenD (US, HK, SGX)
+
+MONITORING LAYER  (monitoring/)
+────────────────────────────────
+dashboard.py        →  6-page Streamlit dashboard (port 8502)
+telegram_alerts.py  →  Trade alerts, daily summaries, Telegram command handler
+price_monitor.py    →  24/7 backup SL/TP watcher (polls every 60s)
+logger.py           →  Structured JSON session logs + trades.csv
+
+MEMORY LAYER  (agents/memory/)
+───────────────────────────────
+reflection_engine.py  →  Post-trade Claude reflections, weekly learning summary
+lessons_learned.md    →  Accumulated trading lessons injected into each session
 ```
 
-## Build Status
+---
 
-| Phase | Focus | Status |
-|-------|-------|--------|
-| 1 | Data pipeline (AV + Finnhub + FMP + NewsAPI + Fear & Greed) | ✅ Complete |
-| 2 | TradingView MCP setup | ✅ Complete |
-| 3 | TradingAgents 7-agent analysis pipeline | ✅ Complete |
-| 4 | Risk gate & position sizing | ✅ Complete |
-| 5 | Paper trading (Alpaca) + APScheduler + Telegram alerts | ✅ Complete |
-| 6 | Live trading (MooMoo/Futu) + Streamlit dashboard | ✅ Complete |
+## Trading Strategy (V2 — ADX Fixed)
 
-## Quick Start
+The V2 baseline strategy was derived from backtesting 7 strategy combinations across META, NVDA, AAPL, and MSFT on 2 years of daily data.
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Timeframe | Daily | Swing trading; holds 1–5 days |
+| ADX filter | > 15 | Trending market filter (now properly fetched) |
+| RSI entry | > 40 | Momentum confirmation |
+| MACD | Line > signal AND > 0 | Trend direction |
+| Volume | > 20-bar SMA | Confirms participation |
+| Stop Loss | ATR(14) × 1.5 | Dynamic, volatility-adjusted |
+| Take Profit | ATR(14) × 3.0 | 2:1 risk/reward ratio |
+| EMA filter | None | Removed — too restrictive on daily |
+| BB filter | None | Removed — was blocking all trades |
+
+**Backtested results (V2 with ADX fix):**
+- META: +7.39% P&L, 2.46 P&L/DD ratio
+- NVDA: +18.35% P&L (ADX fix prevented range-bound entries)
+- Win rate: ~41–44%
+
+**ADX bug fix (May 2025):** ADX > 15 was in agent system prompts but was never fetched from any data source — the bot had no ADX value to evaluate. Fixed by adding `AlphaVantageClient.get_adx()` and wiring `adx_14` into `DataFetcher._fetch_technicals()`.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Language | Python 3.11+ |
+| AI / Agents | Claude claude-sonnet-4-6 (Anthropic API) |
+| Broker | MooMoo / Futu via `futu-api` SDK |
+| Scheduler | APScheduler (BlockingScheduler + CronTrigger) |
+| Dashboard | Streamlit + Plotly |
+| Data (US technical) | Alpha Vantage |
+| Data (US quote/news) | Finnhub |
+| Data (US fundamentals) | FMP (Financial Modeling Prep) |
+| Data (intl/gap-fill) | yfinance |
+| Alerts | Telegram Bot API |
+| Memory | Claude-generated JSON reflections |
+| Deployment | VPS (Ubuntu 26.04) + GitHub auto-deploy |
+
+---
+
+## Infrastructure
+
+### VPS
+- **Host**: 46.62.165.36 (Hetzner CX21, Ubuntu 26.04)
+- **Dashboard**: `http://46.62.165.36:8502`
+- **Auto-deploy**: VPS polls GitHub every 5 minutes, restarts services, and sends a Telegram notification on each deploy
+
+### Systemd services
+| Service | Purpose |
+|---------|---------|
+| `trading-bot` | Main scheduler (scheduler.py) |
+| `price-monitor` | 24/7 SL/TP watcher (monitoring/price_monitor.py) |
+| `dashboard` | Streamlit dashboard on port 8502 |
+
+### FutuOpenD
+MooMoo/Futu requires a locally-running FutuOpenD daemon. The bot connects to `127.0.0.1:11111` by default.
+
+- `TRADING_MODE=paper` → `TrdEnv.SIMULATE` (paper account)
+- `TRADING_MODE=live` → `TrdEnv.REAL` (real account — use with caution)
+
+### Kill switch
+Creating `kill_switch.lock` in the project root immediately halts all trading. Remove the file to resume. Accessible from the Telegram `/killswitch` command or the dashboard Settings page.
+
+---
+
+## Agent Pipeline
+
+Each ticker passes through all 7 agents sequentially. Agents share a conversation thread so later agents can reference earlier analysis.
+
+### 1. Technical Analyst
+Reads: RSI-14, MACD, ADX-14, ATR-14, Bollinger Bands, price action.
+Produces: trend direction, momentum assessment, key support/resistance levels.
+
+### 2. Fundamental Analyst
+Reads: P/E, P/B, EV/EBITDA, ROE, debt/equity, revenue, net income, margins, earnings surprises, analyst targets.
+Produces: valuation assessment, earnings quality, balance sheet health.
+
+### 3. Sentiment Analyst
+Reads: Finnhub news sentiment, recent headlines (up to 15 articles), CNN Fear & Greed Index.
+Produces: news tone, market sentiment, macro backdrop.
+
+### 4. Bull Researcher
+Synthesises the strongest possible bull case from all data. No veto power.
+
+### 5. Bear Researcher
+Synthesises the strongest possible bear case from all data. No veto power.
+
+### 6. Risk Manager
+Evaluates risk/reward. Can downgrade a BUY to HOLD or issue a veto. Flags critical risks (halt, delist, fraud, bankruptcy, SEC investigation).
+
+### 7. Fund Manager
+Makes the final call: **BUY / HOLD / SELL** + confidence score 1.0–10.0.
+- Confidence ≥ 7.0 required for BUY or SELL
+- Python safety guard: any BUY/SELL with confidence < 7.0 is automatically downgraded to HOLD
+- Injects `lessons_learned.md` from past trades into this agent's context
+
+**Output schema:**
+```json
+{
+  "ticker":      "AAPL",
+  "action":      "BUY",
+  "confidence":  8.2,
+  "reasoning":   "...",
+  "bull_case":   "...",
+  "bear_case":   "...",
+  "risk_flags":  [],
+  "analysed_at": "2025-05-22T13:00:00"
+}
+```
+
+### Prompt caching
+All 7 system prompts use `cache_control: {"type": "ephemeral", "ttl": "1h"}`. Because the scheduler runs every ~90 minutes, this saves ~90% of Claude API costs — only the per-ticker market data (user messages) is billed at full price.
+
+---
+
+## Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | List all available commands |
+| `/status` | Bot status — last run, next run, kill switch state, trading mode |
+| `/signals` | Latest BUY/SELL signals from the most recent session |
+| `/positions` | Open positions with entry price, current price, and unrealised P&L |
+| `/history` | Last 10 closed trades with P&L |
+| `/stats` | Win rate, total P&L, R/R ratio, streaks, Sharpe ratio |
+| `/news` | Latest news headlines for watchlist tickers |
+| `/chart` | TradingView chart screenshot for a ticker (e.g. `/chart AAPL`) |
+| `/summary` | Daily P&L summary |
+| `/screenstock` | Run the screener and return top 15 candidates |
+| `/pause` | Activate kill switch (halts trading) |
+| `/resume` | Deactivate kill switch (resumes trading) |
+| `/killswitch` | Toggle kill switch on/off |
+
+---
+
+## Schedule (SGT, Mon–Fri)
+
+| Time (SGT) | Job | Confidence threshold |
+|------------|-----|---------------------|
+| 6:00 PM | Universe auto-update (watchlist_universe.txt refresh) | — |
+| 7:00 PM | Screener runs; Telegram top 15 candidates | — |
+| 8:00 PM | Pre-market analysis | ≥ 8.5 (higher bar pre-open) |
+| 9:30 PM | NYSE open analysis | ≥ 7.0 |
+| 3:00 AM | Afternoon momentum check | ≥ 7.0 |
+| 4:00 AM | Market close — P&L summary, reflection trigger | — |
+| **Sunday 9:00 AM** | Weekly learning summary | — |
+
+---
+
+## Risk Management
+
+### Risk Gate (risk/risk_gate.py)
+
+7 hard checks run in order. Any failure blocks the trade immediately.
+
+| Check | Condition |
+|-------|-----------|
+| 1. Kill switch | `kill_switch.lock` must not exist |
+| 2. Confidence | `decision.confidence >= MIN_CONFIDENCE_SCORE` (default 7.0) |
+| 3. Action validity | Action must be BUY or SELL (not HOLD) |
+| 4. Daily trade limit | `trades_today < MAX_TRADES_PER_DAY` (default 5) |
+| 5. Daily loss limit | `daily_pnl > -MAX_DAILY_LOSS_PCT` (default –2%); auto-activates kill switch if breached |
+| 6. Critical risk flags | No halt / delist / fraud / bankruptcy / SEC investigation flags |
+| 7. Valid price | Quote price must be > 0 |
+
+### Position Sizing (risk/position_sizer.py)
+
+Equity is always fetched live from MooMoo — never hardcoded.
+
+| Confidence | Position size |
+|-----------|--------------|
+| ≥ 9.0 | 100% of max (default 5% of equity) |
+| ≥ 8.0 | 75% of max |
+| ≥ 7.0 | 50% of max |
+
+- **Stop loss**: `entry_price - (ATR × 1.5)`
+- **Take profit**: `entry_price + (ATR × 3.0)`
+- **Minimum trade value**: $100 USD
+- **Fallback** (no ATR): 3% SL, 6% TP (2:1 R/R)
+
+---
+
+## Streamlit Dashboard
+
+6-page dashboard at `http://46.62.165.36:8502` (or `localhost:8502` locally).
+
+| Page | Contents |
+|------|---------|
+| 📊 Live Overview | Account equity, cash, daily P&L, unrealised P&L; bot status (last run, next run, kill switch, mode); latest watchlist signals |
+| 📋 Open Positions | Live positions with entry/current price, quantity, value, unrealised P&L, SL/TP levels, days held; one-click close button |
+| 📜 Trade History | Trade log, cumulative P&L chart, win rate, avg win/loss, profit factor, Sharpe ratio, best/worst trades |
+| 🤖 Bot Decisions | Session browser — full agent reasoning per ticker (technical, fundamental, sentiment, bull/bear case, risk gate result, position sizing, news) |
+| 📈 Performance | Equity curve vs SPY benchmark, drawdown chart, monthly returns heatmap, P&L by ticker bar chart, confidence vs outcome scatter plot |
+| ⚙️ Settings | Kill switch toggle, watchlist editor, risk parameter editor, manual analysis trigger, API status panel |
+
+---
+
+## Running Costs
+
+| Item | Cost / month |
+|------|-------------|
+| Claude API (with prompt caching) | ~$5–15 |
+| Alpha Vantage (free tier) | $0 |
+| Finnhub (free tier) | $0 |
+| FMP (free tier — ⚠️ fundamentals blocked) | $0 |
+| FMP Starter (needed for full signals) | $19 |
+| VPS (Hetzner CX21) | ~$6 |
+| TradingView Essential | ~$13 |
+| **Current total (paper, free APIs)** | **~$5–15/mo** |
+| **Full paper trading total** | **~$24–34/mo** |
+
+---
+
+## Key Decisions & Why
+
+| Decision | Reason |
+|----------|--------|
+| MooMoo/Futu instead of Alpaca | User already has Futu app; supports SGX/HK markets |
+| Daily timeframe | LLMs are too slow for intraday; daily gives time to reason |
+| EMA200 filter removed | Was too restrictive — blocked most valid setups on daily |
+| Bollinger Band filter removed | Was blocking all trades — price rarely touches bands on daily |
+| ADX threshold lowered 20 → 15 | Improved trade frequency without sacrificing trend quality |
+| RSI threshold lowered 50 → 40 | Better entry timing — catches momentum earlier |
+| Fixed 3.0x TP (not dynamic) | Backtesting showed fixed outperforms dynamic TP tiers |
+| FVG filter not used | Too few trades (avg 5 vs 21 without) on daily timeframe |
+| ATR 1.5x SL / 3.0x TP | Backtested as best risk/reward combination across 4 tickers |
+| Dashboard shows USD only | User preference; HKD conversion adds complexity for US stocks |
+| Prompt caching TTL = 1 hour | Scheduler runs ~90 min cycles; 5-min default TTL would always expire |
+
+---
+
+## Known Issues & Watchlist
+
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| FMP free tier blocks fundamentals (403) | Confidence scores capped ~5.5 → most trades are HOLDs | Upgrade FMP to $19/mo Starter plan |
+| Alpha Vantage 25 req/day limit | Can only fully analyse ~3 tickers/day on free tier | Upgrade or cache aggressively |
+| Finnhub sentiment blocked on free tier | No buzz/sentiment scores | Use news headlines as proxy (working) |
+| SGX tickers (DBS.SI etc) have limited data | Singapore stocks get less complete analysis | yfinance fallback partially handles this |
+
+---
+
+## Future Plans
+
+- **Phase 5**: Upgrade FMP to Starter ($19/mo) — unlocks fundamentals, enables real BUY signals
+- **Phase 5**: Telegram command improvements (inline keyboards, position management)
+- **Phase 6**: SGX and HK live trading via Tiger Brokers (`execution/tiger.py`)
+- **Phase 6**: TradingView MCP integration for live chart signals alongside API data
+- **Phase 6**: NautilusTrader backtesting pipeline (`backtest/nautilus_runner.py`)
+- **Ongoing**: Accumulate reflections in `lessons_learned.md` to improve Fund Manager accuracy over time
+
+---
+
+## Setup Guide
+
+### Prerequisites
+
+- Python 3.11+
+- FutuOpenD installed and running (download from Futu/MooMoo desktop app)
+- Telegram bot created via @BotFather
+
+### 1. Clone and install
 
 ```bash
-# 1. Clone and set up environment
 git clone https://github.com/jerometan9742/TradingBot.git
-cd ai-trading-bot
+cd TradingBot
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# 2. Configure API keys
+### 2. Configure environment
+
+```bash
 cp .env.example .env
-nano .env                       # fill in your API keys
+# Edit .env with your API keys
+```
 
-# 3. Create your watchlist
-nano watchlist.txt              # one ticker per line (see Watchlist section below)
+Required `.env` keys:
 
-# 4. Run a single-ticker analysis
+```env
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-6
+
+# Financial data
+ALPHA_VANTAGE_API_KEY=...
+FINNHUB_API_KEY=...
+FMP_API_KEY=...
+NEWSAPI_KEY=...                    # optional
+
+# Broker (MooMoo)
+BROKER=moomoo
+MOOMOO_HOST=127.0.0.1
+MOOMOO_PORT=11111
+TRADING_MODE=paper                 # paper or live
+
+# Telegram
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+
+# Bot config
+WATCHLIST=AAPL,MSFT,NVDA,META
+MAX_POSITION_SIZE_PCT=0.05         # 5% max per position
+MAX_DAILY_LOSS_PCT=0.02            # 2% daily loss kill switch
+MIN_CONFIDENCE_SCORE=7.0
+MAX_TRADES_PER_DAY=5
+```
+
+### 3. Start FutuOpenD
+
+Open the Futu/MooMoo desktop app and ensure FutuOpenD is running on port 11111. For paper trading, select the Simulate account.
+
+### 4. Run
+
+```bash
+# Activate virtualenv
+source venv/bin/activate
+
+# Single ticker analysis (no order placement)
 python run_analysis.py --ticker AAPL
 
-# 5. Run full watchlist
+# Full watchlist analysis
 python run_analysis.py --watchlist
 
-# 6. Launch the Streamlit dashboard
+# Full watchlist + place approved orders
+python run_analysis.py --watchlist --execute
+
+# Start the dashboard
 streamlit run monitoring/dashboard.py
 
-# 7. Start the scheduler (runs at 9am + 3pm SGT daily)
+# Start the full scheduler (runs on the cron schedule above)
 python scheduler.py
 
-# 8. Run tests
+# Run tests
 pytest tests/ -v
+
+# Activate kill switch manually
+touch kill_switch.lock
+
+# Deactivate kill switch
+rm kill_switch.lock
 ```
 
-## Watchlist
+### 5. Deploy to VPS
 
-Create `watchlist.txt` in the project root — one ticker per line. The scheduler
-hot-reloads it on every cycle, so edits take effect without a restart.
+The VPS auto-deploys from GitHub every 5 minutes. Push to `main` to trigger a deploy.
 
-```
-# US stocks
-AAPL
-MSFT
-GOOGL
-NVDA
-
-# SGX stocks — routed via yfinance + MooMoo HK market context
-D05.SI    # DBS Group
-O39.SI    # OCBC Bank
+```bash
+git push origin main
+# VPS will pull and restart services automatically within 5 minutes
+# Telegram notification sent on each deploy
 ```
 
-`watchlist.txt` is `.gitignore`d so every developer keeps their own copy.
-Falls back to the `WATCHLIST` env variable if the file is not found.
-
-## Brokers
-
-### MooMoo / Futu (Primary)
-
-Uses the **Futu OpenAPI** (`futu-api`) to trade US, SGX, and HK stocks from a
-single account.
-
-**Setup:**
-1. Download and install **FutuOpenD** gateway: [futunn.com/download/OpenAPI](https://www.futunn.com/download/OpenAPI)
-2. Start FutuOpenD — it listens on `127.0.0.1:11111` by default
-3. Unlock trading inside FutuOpenD (phone 2FA) once per session
-4. Set `TRADING_MODE=paper` (simulate) or `TRADING_MODE=live` in `.env`
-
-Ticker routing is automatic:
-- `AAPL` → US market
-- `D05.SI`, `0700.HK` → MooMoo HK market context (Futu routes SGX this way)
-
-### Alpaca (Paper Trading Fallback)
-
-Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets` for commission-free
-paper trading on US stocks. No local gateway required.
+---
 
 ## Project Structure
 
 ```
 ai-trading-bot/
+├── CLAUDE.md                     ← Claude Code session reference
+├── README.md                     ← This file
+├── .env                          ← API keys (never commit)
+├── .env.example                  ← Template (safe to commit)
+├── requirements.txt
+├── run_analysis.py               ← Main entry point
+├── scheduler.py                  ← APScheduler cron runner
+├── watchlist.txt                 ← Active trading tickers
+├── watchlist_universe.txt        ← Screener universe
+│
 ├── data/
-│   ├── fetcher.py              # Unified DataFetcher (all sources)
-│   ├── alpha_vantage.py        # Technical indicators + OHLCV history
-│   ├── finnhub.py              # Real-time quotes, news, earnings calendar
-│   ├── fmp.py                  # Fundamentals, ratios, DCF
-│   ├── yfinance_connector.py   # SGX / HK / international fallback (free)
-│   ├── newsapi.py              # News headlines via NewsAPI
-│   └── fear_greed.py           # CNN Fear & Greed Index (free, no key)
-├── charts/
-│   └── chart_reader.py         # TradingView MCP wrapper
+│   ├── fetcher.py                ← Unified DataFetcher (all sources → one dict)
+│   ├── alpha_vantage.py          ← RSI, MACD, BB, ATR, ADX, OHLCV
+│   ├── finnhub.py                ← Real-time quotes, news, earnings, analyst
+│   ├── fmp.py                    ← Fundamentals, ratios, earnings surprises
+│   ├── yfinance_connector.py     ← International tickers + gap-fill
+│   ├── fear_greed.py             ← CNN Fear & Greed Index
+│   ├── newsapi.py                ← NewsAPI connector
+│   ├── screener.py               ← Daily universe screener
+│   └── universe_builder.py       ← Auto-builds watchlist universe
+│
 ├── agents/
-│   ├── trading_agents.py       # 7-agent pipeline
-│   └── skills/                 # Agent skill prompt files
+│   ├── trading_agents.py         ← 7-agent pipeline
+│   ├── skills/                   ← Agent skill prompts
+│   └── memory/
+│       ├── reflection_engine.py  ← Post-trade learning pipeline
+│       ├── lessons_learned.md    ← Accumulated trading lessons
+│       └── reflections/          ← Per-trade JSON reflection files
+│
 ├── risk/
-│   ├── risk_gate.py            # Trade filter + kill switch
-│   └── position_sizer.py       # Fixed-fractional sizing
+│   ├── risk_gate.py              ← 7-check trade filter + kill switch
+│   └── position_sizer.py         ← Fixed-fractional ATR-based sizing
+│
 ├── execution/
-│   ├── moomoo.py               # MooMoo / Futu (US + SGX + HK)
-│   ├── alpaca.py               # Alpaca paper + live (US only)
-│   └── tiger.py                # Tiger Brokers connector
+│   └── moomoo.py                 ← MooMoo/Futu connector (paper + live)
+│
 ├── monitoring/
-│   ├── logger.py               # JSON decision log + trades CSV
-│   ├── telegram_alerts.py      # Telegram notifications
-│   ├── watchlist.py            # Hot-reloading watchlist manager
-│   └── dashboard.py            # Streamlit dashboard (localhost:8501)
+│   ├── dashboard.py              ← Streamlit dashboard (6 pages)
+│   ├── telegram_alerts.py        ← Alert methods + Telegram command handler
+│   ├── telegram_listener.py      ← Command polling thread
+│   ├── price_monitor.py          ← 24/7 backup SL/TP watcher
+│   └── logger.py                 ← JSON session logs + trades.csv
+│
 ├── backtest/
-│   └── nautilus_runner.py      # NautilusTrader backtesting
-├── tests/
-├── scheduler.py                # APScheduler — 9am + 3pm SGT
-├── run_analysis.py             # CLI entry point
-└── watchlist.txt               # Your tickers (gitignored, create locally)
+│   └── nautilus_runner.py        ← NautilusTrader backtesting (planned)
+│
+├── logs/                         ← Session JSON files + trades.csv (gitignored)
+└── tests/
+    ├── test_data_fetcher.py
+    └── test_risk_gate.py
 ```
-
-## VPS Deployment (Hetzner CX23)
-
-Recommended server: **Hetzner CX23** — 2 vCPU ARM, 4 GB RAM, 40 GB SSD, ~€3.79/mo.
-
-### 1 — Provision
-
-```bash
-# Install Hetzner CLI
-brew install hcloud
-
-hcloud server create \
-  --name trading-bot \
-  --type cx23 \
-  --image ubuntu-24.04 \
-  --location sin          # Singapore datacenter
-```
-
-### 2 — Initial server setup
-
-```bash
-# SSH in as root
-ssh root@<SERVER_IP>
-
-# Create a non-root user
-adduser trader && usermod -aG sudo trader
-su - trader
-
-# Install Python 3.11+
-sudo apt update && sudo apt install -y python3.11 python3.11-venv git
-
-# Clone repo
-git clone https://github.com/jerometan9742/TradingBot.git ~/ai-trading-bot
-cd ~/ai-trading-bot
-
-# Virtualenv + dependencies
-python3.11 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Environment & watchlist
-cp .env.example .env
-nano .env               # fill in all API keys
-nano watchlist.txt      # add your tickers
-```
-
-### 3 — systemd service
-
-Create `/etc/systemd/system/trading-bot.service`:
-
-```ini
-[Unit]
-Description=AI Trading Bot Scheduler
-After=network.target
-
-[Service]
-Type=simple
-User=trader
-WorkingDirectory=/home/trader/ai-trading-bot
-EnvironmentFile=/home/trader/ai-trading-bot/.env
-ExecStart=/home/trader/ai-trading-bot/venv/bin/python scheduler.py
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable trading-bot
-sudo systemctl start trading-bot
-
-# Tail logs
-journalctl -u trading-bot -f
-```
-
-### 4 — Dashboard access (SSH tunnel)
-
-The Streamlit dashboard binds to `localhost:8501` inside the VPS. Forward it
-locally via an SSH tunnel — no need to open the port publicly:
-
-```bash
-# On your local machine
-ssh -L 8501:localhost:8501 trader@<SERVER_IP>
-
-# Then open in browser
-open http://localhost:8501
-```
-
-> If you need public access, restrict with `ufw allow from <YOUR_IP> to any port 8501` before binding to `0.0.0.0`.
-
-### 5 — SSH key setup (recommended)
-
-```bash
-# Generate a key pair locally (if you don't have one)
-ssh-keygen -t ed25519 -C "trading-bot-vps"
-
-# Copy to server
-ssh-copy-id -i ~/.ssh/id_ed25519.pub trader@<SERVER_IP>
-
-# Disable password auth on the server
-sudo sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-sudo systemctl restart sshd
-```
-
-## Environment Variables
-
-See `.env.example` for the full list. Key settings:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-6
-
-ALPHA_VANTAGE_API_KEY=...
-FINNHUB_API_KEY=...
-FMP_API_KEY=...              # upgrade to $19/mo for fundamentals
-NEWSAPI_KEY=...
-
-MOOMOO_HOST=127.0.0.1        # FutuOpenD gateway (local or VPS)
-MOOMOO_PORT=11111
-ALPACA_API_KEY=...
-ALPACA_SECRET_KEY=...
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-
-TRADING_MODE=paper           # change to 'live' only after validation
-MAX_POSITION_SIZE_PCT=0.05
-MAX_DAILY_LOSS_PCT=0.02
-MIN_CONFIDENCE_SCORE=7
-MAX_TRADES_PER_DAY=5
-```
-
-## Monthly Running Costs
-
-| Item | Cost |
-|------|------|
-| Claude API (with prompt caching ~90% hit rate) | ~$5–15/mo |
-| Alpha Vantage free tier | $0 |
-| Finnhub free tier | $0 |
-| FMP Starter (required for fundamentals) | $19/mo |
-| NewsAPI free tier | $0 |
-| CNN Fear & Greed (no account needed) | $0 |
-| Hetzner CX23 VPS | ~$5/mo |
-| **Total (paper trading)** | **~$29–39/mo** |
-
-Key optimisation: prompt caching with a 1-hour TTL reduces Claude API costs by
-~90% on repeat scheduler runs.
-
-## Tech Stack
-
-- **Claude Sonnet 4.6** — LLM backbone for all 7 agents
-- **TradingAgents** — multi-agent bull/bear debate framework
-- **TradingView MCP** — live chart data via Chrome DevTools Protocol
-- **Alpha Vantage** — OHLCV + 50+ technical indicators
-- **Finnhub** — real-time quotes, news, earnings calendar
-- **FMP** — fundamentals, ratios, DCF valuation
-- **yfinance** — SGX / HK / international fallback (free, no key required)
-- **NewsAPI** — news headlines
-- **CNN Fear & Greed** — market sentiment index (free)
-- **MooMoo / Futu** — primary broker (US + SGX + HK via FutuOpenD)
-- **Alpaca** — paper trading fallback (US stocks, commission-free)
-- **APScheduler** — 9am + 3pm SGT daily runs
-- **Streamlit + Plotly** — live dashboard at `localhost:8501`
 
 ---
 
-*Built with [Claude](https://anthropic.com) · [TradingAgents](https://github.com/TauricResearch/TradingAgents) · [TradingView MCP](https://github.com/tradesdontlie/tradingview-mcp)*
+*Owner: jerometan9742 | Repo: github.com/jerometan9742/TradingBot*
