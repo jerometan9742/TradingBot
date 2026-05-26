@@ -384,20 +384,28 @@ class TelegramAlerter:
         positions: list,
     ) -> bool:
         """Alert: market close P&L summary (04:00 SGT)."""
-        equity     = portfolio_state.get("equity", 0.0)
-        daily_pnl  = portfolio_state.get("daily_pnl", 0.0)
+        try:
+            from monitoring.logger import compute_realised_pnl
+            _, total_realised = compute_realised_pnl()
+        except Exception:
+            total_realised = 0.0
+
+        equity       = portfolio_state.get("equity", 0.0)
+        daily_pnl    = portfolio_state.get("daily_pnl", 0.0)
         trades_today = portfolio_state.get("trades_today", 0)
 
-        pnl_icon = "📈" if daily_pnl >= 0 else "📉"
-        pnl_sign = "+" if daily_pnl >= 0 else ""
+        pnl_icon      = "📈" if daily_pnl >= 0 else "📉"
+        pnl_sign      = "+" if daily_pnl >= 0 else ""
+        realised_sign = "+" if total_realised >= 0 else "-"
 
         lines = [
             f"{pnl_icon} <b>Market Close Summary</b>",
             f"",
-            f"Equity:       ${equity:,.2f}",
-            f"Daily P&amp;L:    {pnl_sign}${daily_pnl:,.2f}",
-            f"Trades today: {trades_today}",
-            f"Open positions: {len(positions)}",
+            f"Equity:           ${equity:,.2f}",
+            f"Daily P&amp;L:        {pnl_sign}${daily_pnl:,.2f}",
+            f"Total Realised:   {realised_sign}${abs(total_realised):,.2f}",
+            f"Trades today:     {trades_today}",
+            f"Open positions:   {len(positions)}",
         ]
 
         if positions:

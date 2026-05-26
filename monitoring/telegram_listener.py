@@ -876,48 +876,70 @@ class TelegramCommandListener:
         try:
             mm        = self._make_executor()
             positions = mm.get_positions()
+            balance   = mm.get_account_balance()
             mm.close()
         except Exception as exc:
             self._reply(f"❌ MooMoo unavailable: {exc}")
             return
 
+        try:
+            from monitoring.logger import compute_realised_pnl
+            today_pnl, total_realised = compute_realised_pnl()
+        except Exception:
+            today_pnl, total_realised = 0.0, 0.0
+
+        us        = balance.get("by_market", {}).get("US", {})
+        portfolio = us.get("total_assets", balance.get("portfolio_value", 0.0))
+
+        def _fmt(v: float) -> str:
+            return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
+
         if not positions:
-            self._reply("📊 No open positions.")
+            self._reply(
+                "📊 <b>Open Positions</b>\n\n"
+                "No open positions.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Today's P&amp;L:     {_fmt(today_pnl)}\n"
+                f"Total Realised:  {_fmt(total_realised)}\n"
+                f"Portfolio value: ${portfolio:,.2f}"
+            )
             return
 
-        lines      = ["📊 <b>Open Positions:</b>"]
+        lines      = ["📊 <b>Open Positions</b>"]
         total_upnl = 0.0
 
-        for i, p in enumerate(positions, 1):
+        for p in positions:
             ticker  = p.get("display_ticker") or _display_ticker(p.get("ticker", ""))
             qty     = p.get("quantity", 0)
             entry   = p.get("entry_price", 0.0)
-            tpnl    = p.get("today_pnl", 0.0)
 
-            current = p.get("current_price") or 0.0
+            current     = p.get("current_price") or 0.0
             price_label = ""
             if current <= 0:
                 current, price_label = self._fetch_price_with_fallback(ticker, entry)
 
-            # Always recalculate from first principles instead of trusting MooMoo's pl_val
             if entry > 0 and current > 0:
-                upnl = (current - entry) * qty
+                upnl     = (current - entry) * qty
+                upnl_pct = (current - entry) / entry * 100
             else:
-                upnl = p.get("unrealised_pnl", 0.0)
+                upnl     = p.get("unrealised_pnl", 0.0)
+                upnl_pct = (upnl / (entry * qty) * 100) if (entry > 0 and qty > 0) else 0.0
 
             total_upnl += upnl
-            price_str = f"${current:,.2f}" + (f" {price_label}" if price_label else "")
+            current_str = f"${current:,.2f}" + (f" {price_label}" if price_label else "")
 
             lines.append(
-                f"\n{i}. <b>{ticker}</b> — {qty:,} share{'s' if qty != 1 else ''}\n"
-                f"   Avg Cost:    ${entry:,.2f}\n"
-                f"   Current:     {price_str}\n"
-                f"   Unreal P&amp;L: ${_sign(upnl)}{upnl:,.2f}\n"
-                f"   Today P&amp;L:  ${_sign(tpnl)}{tpnl:,.2f}"
+                f"\n<b>{ticker}</b> — {qty:,} share{'s' if qty != 1 else ''}\n"
+                f"  Entry: ${entry:,.2f}  |  Current: {current_str}\n"
+                f"  Unrealised P&amp;L: {_fmt(upnl)} ({'+' if upnl_pct >= 0 else ''}{upnl_pct:.2f}%)"
             )
 
         lines.append(
-            f"\n<b>Total Unrealised P&amp;L: ${_sign(total_upnl)}{total_upnl:,.2f}</b>"
+            f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Today's P&amp;L:     {_fmt(today_pnl)}\n"
+            f"Total Unrealised:  {_fmt(total_upnl)}\n"
+            f"Total Realised:    {_fmt(total_realised)}\n"
+            f"Portfolio value:   ${portfolio:,.2f}"
         )
         self._reply("\n".join(lines))
 
