@@ -6,6 +6,24 @@
 
 ---
 
+## claude-mem Memory Guidance
+
+Key things to always remember across sessions:
+- This is an AI trading bot using MooMoo/Futu paper trading via FutuOpenD on VPS at 46.62.165.36
+- Broker: BROKER=moomoo in .env
+- Dashboard runs at http://46.62.165.36:8502
+- Auto-deploy: VPS polls GitHub every 5 mins, restarts services, sends Telegram notification
+- All Telegram commands are in monitoring/telegram_alerts.py
+- Trade reflections stored in agents/memory/
+- Strategy: Daily timeframe, ADX>15, RSI>40, ATR 1.5x SL / 3.0x TP (V2 baseline)
+- Paper trading $1M USD on MooMoo simulate account
+- Do NOT use Alpaca — broker is MooMoo only
+- Do NOT hardcode PAPER_EQUITY — fetch live from MooMooConnector().get_account_balance()["by_market"]["US"]["total_assets"]
+- Price monitor runs 24/7 as systemd service
+- Scheduler runs at 8pm, 9:30pm, 3am, 4am SGT
+
+---
+
 ## 📌 What This Bot Does
 
 A **daily swing trading signal generator** that:
