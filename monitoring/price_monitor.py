@@ -19,10 +19,12 @@ Usage:
 
 import argparse
 import csv
+import json
 import logging
 import os
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -107,6 +109,35 @@ def _load_sl_tp() -> dict:
     return result
 
 
+def _get_current_price(ticker: str, pos: dict) -> tuple[float, str]:
+    """
+    Return (price, source) for a position.
+    Tries the MooMoo position dict first; falls back to Finnhub if price is 0
+    (FutuOpenD returns last_price=0 outside market hours).
+    """
+    price = float(pos.get("current_price", 0) or 0)
+    if price > 0:
+        return price, "moomoo"
+
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if not api_key:
+        logger.warning("[PriceMonitor] %s — MooMoo price=0 and FINNHUB_API_KEY not set", ticker)
+        return 0.0, "none"
+
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+        price = float(data.get("c", 0) or 0)
+        if price > 0:
+            return price, "finnhub"
+        logger.warning("[PriceMonitor] %s — Finnhub returned price=0", ticker)
+    except Exception as exc:
+        logger.warning("[PriceMonitor] %s — Finnhub quote failed: %s", ticker, exc)
+
+    return 0.0, "none"
+
+
 def _log_exit(ticker: str, quantity: int, price: float, order_id: str) -> None:
     """Append a SELL exit row to logs/trades.csv."""
     TRADES_CSV.parent.mkdir(exist_ok=True)
@@ -185,10 +216,10 @@ class PriceMonitor:
         open_tickers = set()
 
         for pos in positions:
-            raw_code      = pos.get("ticker", "") or pos.get("code", "")
-            ticker        = _futu_to_ticker(raw_code)
-            current_price = float(pos.get("current_price", 0) or 0)
-            quantity      = int(pos.get("quantity", 0) or 0)
+            raw_code                  = pos.get("ticker", "") or pos.get("code", "")
+            ticker                    = _futu_to_ticker(raw_code)
+            current_price, price_src  = _get_current_price(ticker, pos)
+            quantity                  = int(pos.get("quantity", 0) or 0)
 
             open_tickers.add(ticker)
 
@@ -211,8 +242,8 @@ class PriceMonitor:
             tp = sl_tp_map[ticker]["take_profit"]
 
             logger.info(
-                "[PriceMonitor] %s  price=$%.2f  SL=$%.2f  TP=$%.2f",
-                ticker, current_price, sl, tp,
+                "[PriceMonitor] %s  price=$%.2f (source=%-7s)  SL=$%.2f  TP=$%.2f",
+                ticker, current_price, price_src, sl, tp,
             )
 
             if sl > 0 and current_price <= sl:
