@@ -594,6 +594,20 @@ class TradingScheduler:
             decision.get("risk_flags", []),
         )
 
+        # 2b. Skip BUY if we already hold this ticker — prevents double-buying
+        if decision["action"] == "BUY":
+            with self._state_lock:
+                held = {
+                    p.get("display_ticker") or p.get("ticker", "")
+                    for p in self._portfolio_state.get("open_positions", [])
+                }
+            if ticker in held:
+                logger.info(
+                    "[%s] SKIP — position already open, no new BUY will be placed", ticker
+                )
+                blocked_count[0] += 1
+                return
+
         # 2a. Pre-market per-ticker scan signal (sent regardless of whether trade is placed)
         if is_premarket:
             try:
