@@ -87,7 +87,7 @@ class MooMooConnector:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _close_contexts(self):
-        for ctx in (self._ctx_hk, self._ctx_us):
+        for ctx in (getattr(self, "_ctx_hk", None), getattr(self, "_ctx_us", None)):
             if ctx is not None:
                 try:
                     ctx.close()
