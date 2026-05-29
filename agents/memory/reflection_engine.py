@@ -45,6 +45,11 @@ decision that went wrong due to market conditions, note that too. Focus on PATTE
 not one-off events."""
 
 
+def _cache_system(text: str) -> list[dict]:
+    """Wrap a system prompt string in a cache_control block with 1-hour TTL."""
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+
+
 # ---------------------------------------------------------------------------
 # Public class
 # ---------------------------------------------------------------------------
@@ -402,7 +407,7 @@ class ReflectionEngine:
             response = self._client.messages.create(
                 model=MODEL,
                 max_tokens=1024,
-                system=_SYS_REFLECTION,
+                system=_cache_system(_SYS_REFLECTION),
                 messages=[{"role": "user", "content": user_prompt}],
             )
         except Exception:
